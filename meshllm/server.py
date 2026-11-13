@@ -35,6 +35,15 @@ class Worker:
     rpc_endpoint: str | None
     max_parallel_jobs: int
     active_jobs: int
+    available_ram_mb: int | None
+    cpu_percent: float | None
+    gpu_mem_total_mb: int | None
+    gpu_mem_free_mb: int | None
+    gpu_util_percent: float | None
+    battery_percent: float | None
+    battery_plugged: bool | None
+    temperature_c: float | None
+    metrics_updated_at: float | None
     joined_at: float
     last_seen: float
     enabled: bool = True
@@ -50,6 +59,8 @@ class Job:
     worker_id: str | None = None
     response: str | None = None
     error: str | None = None
+    scheduler_score: float | None = None
+    scheduler_decision: str | None = None
 
 
 class PairRequest(BaseModel):
@@ -62,7 +73,26 @@ class PairRequest(BaseModel):
     ollama_url: str | None = Field(default=None, max_length=256)
     rpc_endpoint: str | None = Field(default=None, pattern=r"^[A-Za-z0-9.-]+:[0-9]{1,5}$")
     max_parallel_jobs: int = Field(default=1, ge=1, le=16)
+    available_ram_mb: int | None = Field(default=None, ge=0, le=2_000_000)
+    cpu_percent: float | None = Field(default=None, ge=0, le=100)
+    gpu_mem_total_mb: int | None = Field(default=None, ge=0, le=2_000_000)
+    gpu_mem_free_mb: int | None = Field(default=None, ge=0, le=2_000_000)
+    gpu_util_percent: float | None = Field(default=None, ge=0, le=100)
+    battery_percent: float | None = Field(default=None, ge=0, le=100)
+    battery_plugged: bool | None = None
+    temperature_c: float | None = Field(default=None, ge=-20, le=150)
     pairing_token: str = Field(min_length=16, max_length=128)
+
+
+class HeartbeatMetrics(BaseModel):
+    available_ram_mb: int | None = Field(default=None, ge=0, le=2_000_000)
+    cpu_percent: float | None = Field(default=None, ge=0, le=100)
+    gpu_mem_total_mb: int | None = Field(default=None, ge=0, le=2_000_000)
+    gpu_mem_free_mb: int | None = Field(default=None, ge=0, le=2_000_000)
+    gpu_util_percent: float | None = Field(default=None, ge=0, le=100)
+    battery_percent: float | None = Field(default=None, ge=0, le=100)
+    battery_plugged: bool | None = None
+    temperature_c: float | None = Field(default=None, ge=-20, le=150)
 
 
 class JobRequest(BaseModel):
@@ -93,16 +123,64 @@ async def _mark_stale() -> None:
                 worker.enabled = False
 
 
+def _worker_score(worker: Worker) -> float:
+    """Higher is better: capacity and free slots, tempered by device health."""
+    memory_headroom = (
+        min(1.0, worker.available_ram_mb / max(worker.ram_mb, 1))
+        if worker.available_ram_mb is not None else 0.5
+    )
+    cpu_headroom = (
+        max(0.0, 1.0 - worker.cpu_percent / 100.0)
+        if worker.cpu_percent is not None else 0.5
+    )
+    free_slots = max(
+        0.0, 1.0 - worker.active_jobs / max(worker.max_parallel_jobs, 1)
+    )
+    battery_headroom = 1.0
+    if worker.battery_percent is not None and not worker.battery_plugged:
+        battery_headroom = 0.35 + 0.65 * worker.battery_percent / 100.0
+    thermal_headroom = 1.0
+    if worker.temperature_c is not None:
+        thermal_headroom = max(0.25, min(1.0, (90.0 - worker.temperature_c) / 30.0))
+    gpu_bonus = 0.0
+    if worker.gpu_mem_total_mb and worker.gpu_mem_free_mb is not None:
+        gpu_bonus = 0.03 * max(0.0, min(1.0, worker.gpu_mem_free_mb / worker.gpu_mem_total_mb))
+    base = (
+        0.36 * memory_headroom
+        + 0.25 * cpu_headroom
+        + 0.29 * free_slots
+        + 0.10 * battery_headroom
+    )
+    return round(min(1.0, base * thermal_headroom + gpu_bonus), 4)
+
+
+def _worker_is_eligible(worker: Worker) -> bool:
+    if not worker.enabled or not worker.ollama_url:
+        return False
+    if worker.active_jobs >= worker.max_parallel_jobs:
+        return False
+    if worker.temperature_c is not None and worker.temperature_c >= 85.0:
+        return False
+    if (worker.battery_percent is not None and worker.battery_percent <= 5.0
+            and not worker.battery_plugged):
+        return False
+    return True
+
+
 async def _run_job(job: Job, max_tokens: int) -> None:
     selected: Worker | None = None
     async with lock:
-        candidates = [w for w in workers.values()
-                      if w.enabled and w.ollama_url and w.active_jobs < w.max_parallel_jobs]
-        candidates.sort(key=lambda w: (w.active_jobs / w.max_parallel_jobs, -w.ram_mb))
+        candidates = [w for w in workers.values() if _worker_is_eligible(w)]
+        candidates.sort(key=lambda w: (-_worker_score(w), w.name.lower()))
         if candidates:
             selected = candidates[0]
             selected.active_jobs += 1
             job.worker_id = selected.worker_id
+            job.scheduler_score = _worker_score(selected)
+            job.scheduler_decision = (
+                "Selected highest health-aware capacity score; "
+                "thermal and critical-battery limits were applied."
+            )
             job.status = "running"
 
     if selected is None:
@@ -170,6 +248,15 @@ async def register_worker(req: PairRequest) -> dict[str, Any]:
         cpu_threads=req.cpu_threads, ram_mb=req.ram_mb, gpu_name=req.gpu_name,
         runtimes=req.runtimes, ollama_url=req.ollama_url, rpc_endpoint=req.rpc_endpoint,
         max_parallel_jobs=req.max_parallel_jobs, active_jobs=0,
+        available_ram_mb=req.available_ram_mb, cpu_percent=req.cpu_percent,
+        gpu_mem_total_mb=req.gpu_mem_total_mb, gpu_mem_free_mb=req.gpu_mem_free_mb,
+        gpu_util_percent=req.gpu_util_percent, battery_percent=req.battery_percent,
+        battery_plugged=req.battery_plugged, temperature_c=req.temperature_c,
+        metrics_updated_at=now if any(value is not None for value in (
+            req.available_ram_mb, req.cpu_percent, req.gpu_mem_total_mb,
+            req.gpu_mem_free_mb, req.gpu_util_percent, req.battery_percent,
+            req.battery_plugged, req.temperature_c
+        )) else None,
         joined_at=now, last_seen=now,
     )
     async with lock:
@@ -178,13 +265,18 @@ async def register_worker(req: PairRequest) -> dict[str, Any]:
 
 
 @app.post("/api/workers/{worker_id}/heartbeat")
-async def heartbeat(worker_id: str) -> dict[str, bool]:
+async def heartbeat(worker_id: str, metrics: HeartbeatMetrics | None = None) -> dict[str, bool]:
     async with lock:
         worker = workers.get(worker_id)
         if worker is None:
             raise HTTPException(status_code=404, detail="Unknown worker")
         worker.last_seen = time.time()
         worker.enabled = True
+        if metrics is not None:
+            for field, value in metrics.model_dump(exclude_unset=True).items():
+                setattr(worker, field, value)
+            if metrics.model_dump(exclude_unset=True):
+                worker.metrics_updated_at = worker.last_seen
     return {"ok": True}
 
 
@@ -201,9 +293,17 @@ async def leave_worker(worker_id: str) -> dict[str, bool]:
 async def list_workers() -> list[dict[str, Any]]:
     await _mark_stale()
     async with lock:
-        return [{**asdict(w), "online": w.enabled,
-                 "last_seen_ago_seconds": round(time.time() - w.last_seen, 1)}
-                for w in workers.values()]
+        return [{
+            **asdict(w),
+            "online": w.enabled,
+            "eligible_for_inference": _worker_is_eligible(w),
+            "scheduler_score": _worker_score(w),
+            "last_seen_ago_seconds": round(time.time() - w.last_seen, 1),
+            "metrics_age_seconds": (
+                round(time.time() - w.metrics_updated_at, 1)
+                if w.metrics_updated_at is not None else None
+            ),
+        } for w in workers.values()]
 
 
 @app.post("/api/jobs")
