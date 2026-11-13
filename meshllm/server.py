@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import math
+import os
 import secrets
 import shlex
 import time
 import uuid
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -18,6 +21,11 @@ from pydantic import BaseModel, Field
 
 PAIR_TTL_SECONDS = 300
 HEARTBEAT_TIMEOUT_SECONDS = 30
+APP_VERSION = "0.3.0-dev"
+APP_BUILD_TIMESTAMP = os.getenv(
+    "MESHELL_BUILD_TIMESTAMP", datetime.now(timezone.utc).isoformat()
+)
+pair_sessions: dict[str, dict[str, Any]] = {}
 MAX_PROMPT_CHARS = 16_000
 MAX_OUTPUT_TOKENS = 2048
 
@@ -81,7 +89,29 @@ class PairRequest(BaseModel):
     battery_percent: float | None = Field(default=None, ge=0, le=100)
     battery_plugged: bool | None = None
     temperature_c: float | None = Field(default=None, ge=-20, le=150)
-    pairing_token: str = Field(min_length=16, max_length=128)
+    pairing_token: str | None = Field(default=None, min_length=16, max_length=128)
+    pairing_session_id: str | None = Field(default=None, min_length=16, max_length=128)
+    worker_secret: str | None = Field(default=None, min_length=32, max_length=128)
+
+
+class PairSessionRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    platform: str = Field(min_length=1, max_length=40)
+    cpu_threads: int = Field(ge=1, le=512)
+    ram_mb: int = Field(ge=128, le=2_000_000)
+    gpu_name: str | None = Field(default=None, max_length=128)
+    runtimes: list[str] = Field(default_factory=list, max_length=16)
+    ollama_url: str | None = Field(default=None, max_length=256)
+    rpc_endpoint: str | None = Field(default=None, pattern=r"^[A-Za-z0-9.-]+:[0-9]{1,5}$")
+    max_parallel_jobs: int = Field(default=1, ge=1, le=16)
+    available_ram_mb: int | None = Field(default=None, ge=0, le=2_000_000)
+    cpu_percent: float | None = Field(default=None, ge=0, le=100)
+    gpu_mem_total_mb: int | None = Field(default=None, ge=0, le=2_000_000)
+    gpu_mem_free_mb: int | None = Field(default=None, ge=0, le=2_000_000)
+    gpu_util_percent: float | None = Field(default=None, ge=0, le=100)
+    battery_percent: float | None = Field(default=None, ge=0, le=100)
+    battery_plugged: bool | None = None
+    temperature_c: float | None = Field(default=None, ge=-20, le=150)
 
 
 class HeartbeatMetrics(BaseModel):
@@ -217,7 +247,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="MeshLLM Coordinator", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="MeshLLM Coordinator", version=APP_VERSION, lifespan=lifespan)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -229,8 +259,14 @@ async def dashboard() -> str:
 async def health() -> dict[str, Any]:
     await _mark_stale()
     async with lock:
-        return {"status": "ok", "workers": len(workers),
-                "online_workers": sum(w.enabled for w in workers.values()), "jobs": len(jobs)}
+        return {
+            "status": "ok", "version": APP_VERSION,
+            "build_timestamp_utc": APP_BUILD_TIMESTAMP,
+            "server_time_utc": datetime.now(timezone.utc).isoformat(),
+            "workers": len(workers),
+            "online_workers": sum(w.enabled for w in workers.values()),
+            "jobs": len(jobs),
+        }
 
 
 @app.post("/api/pairing-token")
