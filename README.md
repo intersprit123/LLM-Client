@@ -55,12 +55,14 @@ MeshLLM now generates an automatic tensor-split estimate when no manual split is
 - `POST /api/pairing-sessions/{session_id}/approve`
 - `GET /pair/approve/{session_id}`
 - `POST /api/workers/register` — requires a single-use, owner-approved QR session
-- `POST /api/workers/{worker_id}/heartbeat`
-- `POST /api/workers/{worker_id}/leave`
+- `POST /api/workers/{worker_id}/heartbeat` — requires the private `X-Worker-Token`
+- `POST /api/workers/{worker_id}/leave` — requires the private `X-Worker-Token`
 - `GET /api/workers` — includes latest telemetry, eligibility and scheduler score
 - `GET /api/scheduler/preview` — explains the automatic ranking and exclusion decisions
 - `POST /api/jobs` and `GET /api/jobs/{job_id}`
-- `POST /api/distributed/plan` — creates a reviewed llama.cpp launch plan; it never launches a process.
+- `GET /api/network/probe` — no-cache payload for one-time link-throughput estimation
+- `POST /api/distributed/plan` — creates a reviewed llama.cpp launch plan; it never launches a process
+- `POST /api/hybrid/plan` — combines a model-sharding plan with the independent Ollama worker pool
 
 ## Automatic resource decisions
 
@@ -70,7 +72,11 @@ After the owner approves pairing, a worker sends CPU load, available RAM, suppor
 python -m pip install psutil
 ```
 
-Workers also run a small CPU throughput probe at startup and measure coordinator round-trip time during heartbeats. These are coarse scheduling signals, not a substitute for benchmarking actual model tokens/second or GPU kernels. The coordinator ranks available Ollama workers using free-memory headroom, CPU headroom, free job slots, battery state, CPU probe score and network round-trip time. It does not ask the user to assign manual percentages. It excludes workers at or above 85°C and workers at 5% battery or lower when unplugged. These are conservative initial thresholds, not a substitute for device firmware thermal protection. The policy is a first milestone and will be tuned with real mixed-device benchmarks.
+Workers run a small CPU throughput probe at enrollment and, when optional PyTorch with CUDA/ROCm or Apple MPS is installed, a tiny GPU matrix-multiplication probe. The GPU probe is skipped when no supported PyTorch device is available. A one-time coordinator link-throughput estimate and ongoing round-trip-time measurements provide network signals. These are coarse scheduling signals, not a substitute for benchmarking actual model tokens/second on the target model. The coordinator ranks available Ollama workers using free-memory headroom, CPU headroom, free job slots, battery state, CPU/GPU probe scores and network RTT/bandwidth. It does not ask the user to assign manual percentages. It excludes workers at or above 85°C and workers at 5% battery or lower when unplugged. These are conservative initial thresholds, not a substitute for device firmware thermal protection. The policy is a first milestone and will be tuned with real mixed-device benchmarks.
+
+After QR approval, each worker receives a private random credential; only its hash is retained by the coordinator. Heartbeat and leave operations require the credential in the `X-Worker-Token` header, and public worker listings never expose it. This is application-level authentication, not transport encryption: use HTTPS or a trusted isolated LAN.
+
+Inference jobs automatically fail over to the next eligible worker when a selected Ollama endpoint errors. The hybrid planner describes how one RPC-sharded model server and separate Ollama workers can coexist; live cross-backend request routing is still future work.
 
 ## Platform reality
 
