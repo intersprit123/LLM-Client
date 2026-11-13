@@ -167,15 +167,18 @@ def battery_metrics() -> dict:
 
 
 def temperature_c() -> float | None:
-    try:
-        for path in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+    readings = []
+    for path in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        try:
             with open(path, encoding="utf-8") as f:
                 raw = float(f.read().strip())
             value = raw / 1000.0 if raw > 200 else raw
             if -20 <= value <= 150:
-                return round(value, 1)
-    except Exception:
-        pass
+                readings.append(value)
+        except (OSError, ValueError):
+            continue
+    if readings:
+        return round(max(readings), 1)
     try:
         import psutil
         sensors = psutil.sensors_temperatures()
