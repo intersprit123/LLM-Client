@@ -36,7 +36,7 @@ def register(client, **overrides):
     credentials = session.json()
     approved = client.post(
         f"/api/pairing-sessions/{credentials['session_id']}/approve",
-        params={"worker_secret": credentials["worker_secret"]},
+        json={"worker_secret": credentials["worker_secret"]},
     )
     assert approved.status_code == 200
     return client.post("/api/workers/register", json={
@@ -65,7 +65,7 @@ def test_qr_pairing_requires_owner_approval_and_is_single_use():
         assert denied.status_code == 403
         approved = client.post(
             f"/api/pairing-sessions/{session['session_id']}/approve",
-            params={"worker_secret": session["worker_secret"]},
+            json={"worker_secret": session["worker_secret"]},
         )
         assert approved.status_code == 200
         assert client.post("/api/workers/register", json=payload).status_code == 200
@@ -78,11 +78,12 @@ def test_qr_approval_page_shows_device_and_requires_secret():
         metadata = {"name": "My laptop", "platform": "Linux", "cpu_threads": 8, "ram_mb": 8192}
         session = client.post("/api/pairing-sessions", json=metadata).json()
         path = f"/pair/approve/{session['session_id']}"
-        assert client.get(path).status_code == 422
-        page = client.get(path, params={"worker_secret": session["worker_secret"]})
+        page = client.get(path)
         assert page.status_code == 200
         assert "My laptop" in page.text
         assert "Approve this device" in page.text
+        assert "location.hash.slice(1)" in page.text
+        assert session["worker_secret"] not in page.text
 
 
 def test_health_exposes_build_and_server_timestamps():
