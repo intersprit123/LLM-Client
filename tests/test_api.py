@@ -210,3 +210,35 @@ def test_legacy_empty_heartbeat_remains_accepted():
         worker_id = register(client).json()["worker_id"]
         response = client.post(f"/api/workers/{worker_id}/heartbeat")
         assert response.status_code == 200
+
+
+
+def test_automatic_tensor_split_uses_reported_worker_memory():
+    with TestClient(app) as client:
+        register(
+            client, name="GPU node", rpc_endpoint="192.168.1.22:50052",
+            gpu_mem_free_mb=6144, available_ram_mb=8192,
+        )
+        response = client.post("/api/distributed/plan", json={
+            "model_path": "model.gguf", "local_memory_mb": 4096,
+        })
+        assert response.status_code == 200
+        plan = response.json()
+        assert plan["tensor_split_source"] == "automatic_memory_estimate"
+        assert "--tensor-split" in plan["argv"]
+        split = plan["tensor_split"].split(",")
+        assert len(split) == 2
+        assert abs(sum(float(value) for value in split) - 1.0) < 0.001
+        assert plan["memory_estimates"][1]["usable_memory_mb"] == 6144
+        assert plan["memory_estimates"][1]["source"] == "free_vram"
+
+
+def test_manual_tensor_split_overrides_automatic_split():
+    with TestClient(app) as client:
+        register(client, rpc_endpoint="192.168.1.22:50052")
+        response = client.post("/api/distributed/plan", json={
+            "model_path": "model.gguf", "tensor_split": "2,1",
+        })
+        assert response.status_code == 200
+        assert response.json()["tensor_split"] == "2,1"
+        assert response.json()["tensor_split_source"] == "manual"
