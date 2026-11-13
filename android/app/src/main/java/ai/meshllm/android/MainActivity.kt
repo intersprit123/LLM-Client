@@ -32,6 +32,7 @@ private fun MeshTheme(content: @Composable () -> Unit) {
     MaterialTheme(colorScheme = darkColorScheme(), content = content)
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MeshApp() {
     var mode by remember { mutableStateOf(ClusterMode.OFF) }
