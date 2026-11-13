@@ -231,14 +231,15 @@ def gpu_benchmark_score() -> float | None:
         return None
 
 
-def collect_telemetry() -> dict:
+def collect_telemetry(include_benchmarks: bool = True) -> dict:
     telemetry = {
         "available_ram_mb": available_memory_mb(),
         "cpu_percent": cpu_percent(),
         "temperature_c": temperature_c(),
-        "cpu_benchmark_score": cpu_benchmark_score(),
-        "gpu_benchmark_score": gpu_benchmark_score(),
     }
+    if include_benchmarks:
+        telemetry["cpu_benchmark_score"] = cpu_benchmark_score()
+        telemetry["gpu_benchmark_score"] = gpu_benchmark_score()
     telemetry.update(gpu_metrics())
     telemetry.update(battery_metrics())
     return {key: value for key, value in telemetry.items() if value is not None}
@@ -312,7 +313,7 @@ async def main() -> None:
         print(f"Joined. Worker ID: {worker_id}. Press Ctrl+C to leave.")
         try:
             while True:
-                heartbeat_metrics = collect_telemetry()
+                heartbeat_metrics = collect_telemetry(include_benchmarks=False)
                 # Benchmarks run once at join time, not on every heartbeat.
                 heartbeat_metrics["cpu_benchmark_score"] = telemetry.get("cpu_benchmark_score")
                 heartbeat_metrics["gpu_benchmark_score"] = telemetry.get("gpu_benchmark_score")
