@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from meshllm.server import (
-    app, jobs, pair_sessions, workers, _worker_is_eligible, _worker_score,
+    app, jobs, pair_sessions, worker_auth_hashes, workers, _worker_is_eligible, _worker_score,
 )
 
 
@@ -11,10 +11,12 @@ def reset_state():
     workers.clear()
     jobs.clear()
     pair_sessions.clear()
+    worker_auth_hashes.clear()
     yield
     workers.clear()
     jobs.clear()
     pair_sessions.clear()
+    worker_auth_hashes.clear()
 
 
 def register(client, **overrides):
@@ -157,8 +159,9 @@ def test_heartbeat_updates_live_telemetry():
     with TestClient(app) as client:
         response = register(client)
         worker_id = response.json()["worker_id"]
+        headers = {"X-Worker-Token": response.json()["worker_token"]}
         heartbeat = client.post(
-            f"/api/workers/{worker_id}/heartbeat",
+            f"/api/workers/{worker_id}/heartbeat", headers=headers,
             json={"available_ram_mb": 1536, "cpu_percent": 71.0, "temperature_c": 67.5},
         )
         assert heartbeat.status_code == 200
@@ -209,7 +212,16 @@ def test_legacy_empty_heartbeat_remains_accepted():
     with TestClient(app) as client:
         worker_id = register(client).json()["worker_id"]
         response = client.post(f"/api/workers/{worker_id}/heartbeat")
-        assert response.status_code == 200
+        assert response.status_code == 401
+        registration = client.get("/api/workers").json()[0]
+        # The registration response, not the public worker listing, carries the secret.
+        token_response = register(client, name="Authenticated device")
+        auth_id = token_response.json()["worker_id"]
+        auth_token = token_response.json()["worker_token"]
+        assert client.post(
+            f"/api/workers/{auth_id}/heartbeat",
+            headers={"X-Worker-Token": auth_token},
+        ).status_code == 200
 
 
 
@@ -247,12 +259,32 @@ def test_manual_tensor_split_overrides_automatic_split():
 
 def test_heartbeat_records_network_rtt_and_cpu_benchmark():
     with TestClient(app) as client:
-        worker_id = register(client, cpu_benchmark_score=180000.0).json()["worker_id"]
+        registration = register(client, cpu_benchmark_score=180000.0).json()
+        worker_id = registration["worker_id"]
         response = client.post(
             f"/api/workers/{worker_id}/heartbeat",
+            headers={"X-Worker-Token": registration["worker_token"]},
             json={"network_rtt_ms": 42.5, "cpu_benchmark_score": 190000.0},
         )
         assert response.status_code == 200
         worker = client.get("/api/workers").json()[0]
         assert worker["network_rtt_ms"] == 42.5
         assert worker["cpu_benchmark_score"] == 190000.0
+
+
+
+def test_worker_endpoints_require_private_token_and_listing_does_not_leak_it():
+    with TestClient(app) as client:
+        registration = register(client).json()
+        worker_id = registration["worker_id"]
+        token = registration["worker_token"]
+        assert "worker_token" not in client.get("/api/workers").text
+        assert client.post(
+            f"/api/workers/{worker_id}/heartbeat",
+            headers={"X-Worker-Token": "wrong"},
+        ).status_code == 403
+        assert client.post(f"/api/workers/{worker_id}/leave").status_code == 401
+        assert client.post(
+            f"/api/workers/{worker_id}/leave",
+            headers={"X-Worker-Token": token},
+        ).status_code == 200
