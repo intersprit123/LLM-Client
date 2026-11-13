@@ -1,6 +1,18 @@
+import pytest
 from fastapi.testclient import TestClient
 
-from meshllm.server import app
+from meshllm.server import app, jobs, pair_tokens, workers
+
+
+@pytest.fixture(autouse=True)
+def reset_state():
+    workers.clear()
+    jobs.clear()
+    pair_tokens.clear()
+    yield
+    workers.clear()
+    jobs.clear()
+    pair_tokens.clear()
 
 
 def register(client, **overrides):
@@ -67,3 +79,12 @@ def test_tensor_split_requires_one_positive_value_per_endpoint_plus_local():
             "model_path": "model.gguf", "tensor_split": "1,2"
         })
         assert good.status_code == 200
+
+
+def test_tensor_split_rejects_non_finite_values():
+    with TestClient(app) as client:
+        register(client, rpc_endpoint="192.168.1.22:50052")
+        response = client.post("/api/distributed/plan", json={
+            "model_path": "model.gguf", "tensor_split": "1,nan"
+        })
+        assert response.status_code == 422
