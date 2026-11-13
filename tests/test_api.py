@@ -2,7 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from meshllm.server import (
-    app, jobs, pair_tokens, workers, _worker_is_eligible, _worker_score,
+    app, jobs, pair_sessions, workers, _worker_is_eligible, _worker_score,
 )
 
 
@@ -10,7 +10,7 @@ from meshllm.server import (
 def reset_state():
     workers.clear()
     jobs.clear()
-    pair_tokens.clear()
+    pair_sessions.clear()
     yield
     workers.clear()
     jobs.clear()
@@ -18,15 +18,25 @@ def reset_state():
 
 
 def register(client, **overrides):
-    token = client.post("/api/pairing-token").json()["pairing_token"]
     body = {
         "name": "Test device", "platform": "Test OS", "cpu_threads": 4,
         "ram_mb": 4096, "gpu_name": "Test GPU", "runtimes": [],
         "ollama_url": "http://127.0.0.1:11434", "rpc_endpoint": None,
-        "max_parallel_jobs": 2, "pairing_token": token,
+        "max_parallel_jobs": 2,
     }
     body.update(overrides)
-    return client.post("/api/workers/register", json=body)
+    session = client.post("/api/pairing-sessions", json=body)
+    assert session.status_code == 200
+    credentials = session.json()
+    approved = client.post(
+        f"/api/pairing-sessions/{credentials['session_id']}/approve",
+        params={"worker_secret": credentials["worker_secret"]},
+    )
+    assert approved.status_code == 200
+    return client.post("/api/workers/register", json={
+        **body, "pairing_session_id": credentials["session_id"],
+        "worker_secret": credentials["worker_secret"],
+    })
 
 
 def test_health():
@@ -36,13 +46,45 @@ def test_health():
         assert response.json()["status"] == "ok"
 
 
-def test_pairing_token_is_single_use():
+def test_qr_pairing_requires_owner_approval_and_is_single_use():
     with TestClient(app) as client:
-        token = client.post("/api/pairing-token").json()["pairing_token"]
-        body = {"name": "Test device", "platform": "Test OS", "cpu_threads": 4,
-                "ram_mb": 4096, "pairing_token": token}
-        assert client.post("/api/workers/register", json=body).status_code == 200
-        assert client.post("/api/workers/register", json=body).status_code == 401
+        metadata = {
+            "name": "Test device", "platform": "Test OS", "cpu_threads": 4,
+            "ram_mb": 4096, "max_parallel_jobs": 1,
+        }
+        session = client.post("/api/pairing-sessions", json=metadata).json()
+        payload = {**metadata, "pairing_session_id": session["session_id"],
+                   "worker_secret": session["worker_secret"]}
+        denied = client.post("/api/workers/register", json=payload)
+        assert denied.status_code == 403
+        approved = client.post(
+            f"/api/pairing-sessions/{session['session_id']}/approve",
+            params={"worker_secret": session["worker_secret"]},
+        )
+        assert approved.status_code == 200
+        assert client.post("/api/workers/register", json=payload).status_code == 200
+        assert client.post("/api/workers/register", json=payload).status_code == 404
+        assert client.post("/api/pairing-token").status_code == 404
+
+
+def test_qr_approval_page_shows_device_and_requires_secret():
+    with TestClient(app) as client:
+        metadata = {"name": "My laptop", "platform": "Linux", "cpu_threads": 8, "ram_mb": 8192}
+        session = client.post("/api/pairing-sessions", json=metadata).json()
+        path = f"/pair/approve/{session['session_id']}"
+        assert client.get(path).status_code == 422
+        page = client.get(path, params={"worker_secret": session["worker_secret"]})
+        assert page.status_code == 200
+        assert "My laptop" in page.text
+        assert "Approve this device" in page.text
+
+
+def test_health_exposes_build_and_server_timestamps():
+    with TestClient(app) as client:
+        health = client.get("/api/health").json()
+        assert health["version"] == "0.3.0-dev"
+        assert health["build_timestamp_utc"]
+        assert health["server_time_utc"]
 
 
 def test_worker_registers_rpc_endpoint_and_concurrency():
