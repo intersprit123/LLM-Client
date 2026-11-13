@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-import base64
+import hmac
 import math
 import os
 import secrets
@@ -89,9 +89,8 @@ class PairRequest(BaseModel):
     battery_percent: float | None = Field(default=None, ge=0, le=100)
     battery_plugged: bool | None = None
     temperature_c: float | None = Field(default=None, ge=-20, le=150)
-    pairing_token: str | None = Field(default=None, min_length=16, max_length=128)
-    pairing_session_id: str | None = Field(default=None, min_length=16, max_length=128)
-    worker_secret: str | None = Field(default=None, min_length=32, max_length=128)
+    pairing_session_id: str = Field(min_length=16, max_length=128)
+    worker_secret: str = Field(min_length=32, max_length=128)
 
 
 class PairSessionRequest(BaseModel):
@@ -141,7 +140,6 @@ class DistributedPlanRequest(BaseModel):
 
 workers: dict[str, Worker] = {}
 jobs: dict[str, Job] = {}
-pair_tokens: dict[str, float] = {}
 lock = asyncio.Lock()
 
 
@@ -269,18 +267,74 @@ async def health() -> dict[str, Any]:
         }
 
 
-@app.post("/api/pairing-token")
-async def create_pairing_token() -> dict[str, Any]:
-    token = secrets.token_urlsafe(24)
-    pair_tokens[token] = time.time() + PAIR_TTL_SECONDS
-    return {"pairing_token": token, "expires_in_seconds": PAIR_TTL_SECONDS}
+@app.post("/api/pairing-sessions")
+async def create_pairing_session(req: PairSessionRequest) -> dict[str, Any]:
+    session_id = secrets.token_urlsafe(24)
+    worker_secret = secrets.token_urlsafe(32)
+    pair_sessions[session_id] = {
+        "worker_secret": worker_secret,
+        "approved": False,
+        "expires_at": time.time() + PAIR_TTL_SECONDS,
+        "metadata": req.model_dump(),
+    }
+    return {
+        "session_id": session_id,
+        "worker_secret": worker_secret,
+        "expires_in_seconds": PAIR_TTL_SECONDS,
+        "approval_path": f"/pair/approve/{session_id}",
+    }
+
+
+def _pair_session(session_id: str, worker_secret: str) -> dict[str, Any]:
+    session = pair_sessions.get(session_id)
+    if session is None or not hmac.compare_digest(session["worker_secret"], worker_secret):
+        raise HTTPException(status_code=404, detail="Pairing request not found")
+    if session["expires_at"] < time.time():
+        pair_sessions.pop(session_id, None)
+        raise HTTPException(status_code=410, detail="Pairing request expired")
+    return session
+
+
+@app.get("/api/pairing-sessions/{session_id}/status")
+async def pairing_status(session_id: str, worker_secret: str) -> dict[str, Any]:
+    session = _pair_session(session_id, worker_secret)
+    return {"status": "approved" if session["approved"] else "waiting"}
+
+
+@app.post("/api/pairing-sessions/{session_id}/approve")
+async def approve_pairing(session_id: str, worker_secret: str) -> dict[str, bool]:
+    session = _pair_session(session_id, worker_secret)
+    session["approved"] = True
+    session["approved_at"] = time.time()
+    return {"approved": True}
+
+
+@app.get("/pair/approve/{session_id}", response_class=HTMLResponse)
+async def pairing_approval_page(session_id: str, worker_secret: str) -> str:
+    session = _pair_session(session_id, worker_secret)
+    metadata = session["metadata"]
+    safe_name = (metadata["name"].replace("&", "&amp;").replace("<", "&lt;")
+                 .replace(">", "&gt;").replace('"', "&quot;"))
+    return f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Approve MeshLLM device</title><style>body{{font:16px system-ui;background:#0b1020;color:#eef;padding:28px;max-width:520px;margin:auto}}
+    main{{background:#151d33;padding:24px;border-radius:16px}}button{{padding:14px 20px;background:#6d83ff;color:white;border:0;border-radius:10px;font-size:16px}}</style></head>
+    <body><main><h1>Approve device?</h1><p><b>{safe_name}</b> wants to join your MeshLLM cluster.</p>
+    <p>Platform: {metadata["platform"]}</p><p>CPU threads: {metadata["cpu_threads"]} · RAM: {metadata["ram_mb"]} MB</p>
+    <p>This QR approval expires in five minutes. Only approve a device you control.</p>
+    <button id="approve" onclick="approve()">Approve this device</button><p id="result"></p></main>
+    <script>async function approve(){{let b=document.getElementById('approve');b.disabled=true;
+    let r=await fetch('/api/pairing-sessions/{session_id}/approve?worker_secret={worker_secret}',{{method:'POST'}});
+    document.getElementById('result').textContent=r.ok?'Approved. The worker can now join.':'Approval failed or expired.';}}</script></body></html>"""
 
 
 @app.post("/api/workers/register")
 async def register_worker(req: PairRequest) -> dict[str, Any]:
-    expiry = pair_tokens.pop(req.pairing_token, None)
-    if expiry is None or expiry < time.time():
-        raise HTTPException(status_code=401, detail="Invalid or expired pairing token")
+    session = _pair_session(req.pairing_session_id, req.worker_secret)
+    if not session["approved"]:
+        raise HTTPException(status_code=403, detail="Device has not been approved by QR")
+    if session["metadata"] != req.model_dump(exclude={"pairing_session_id", "worker_secret"}):
+        raise HTTPException(status_code=400, detail="Worker details changed after QR approval")
+    pair_sessions.pop(req.pairing_session_id, None)
     if req.rpc_endpoint and not (1 <= int(req.rpc_endpoint.rsplit(":", 1)[1]) <= 65535):
         raise HTTPException(status_code=422, detail="RPC port must be between 1 and 65535")
     worker_id = str(uuid.uuid4())
