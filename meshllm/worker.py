@@ -289,7 +289,7 @@ async def main() -> None:
         session_response = await client.post(base + "/api/pairing-sessions", json=metadata)
         session_response.raise_for_status()
         session = session_response.json()
-        approval_url = base + session["approval_path"] + "?worker_secret=" + session["worker_secret"]
+        approval_url = base + session["approval_path"] + "#" + session["worker_secret"]
         qr = qrcode.QRCode(border=2)
         qr.add_data(approval_url)
         qr.make(fit=True)
@@ -300,7 +300,7 @@ async def main() -> None:
         while time.monotonic() < deadline:
             status_response = await client.get(
                 base + f"/api/pairing-sessions/{session['session_id']}/status",
-                params={"worker_secret": session["worker_secret"]},
+                headers={"X-Pairing-Secret": session["worker_secret"]},
             )
             if status_response.status_code == 410:
                 raise SystemExit("QR approval expired. Restart the worker to create a new QR.")
