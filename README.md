@@ -70,7 +70,7 @@ After the owner approves pairing, a worker sends CPU load, available RAM, suppor
 python -m pip install psutil
 ```
 
-The coordinator continuously ranks available Ollama workers using free-memory headroom, CPU headroom, free job slots and battery state. It does not ask the user to assign manual percentages. It excludes workers at or above 85°C and workers at 5% battery or lower when unplugged. These are conservative initial thresholds, not a substitute for device firmware thermal protection. The policy is a first milestone and will be tuned with real mixed-device benchmarks.
+Workers also run a small CPU throughput probe at startup and measure coordinator round-trip time during heartbeats. These are coarse scheduling signals, not a substitute for benchmarking actual model tokens/second or GPU kernels. The coordinator ranks available Ollama workers using free-memory headroom, CPU headroom, free job slots, battery state, CPU probe score and network round-trip time. It does not ask the user to assign manual percentages. It excludes workers at or above 85°C and workers at 5% battery or lower when unplugged. These are conservative initial thresholds, not a substitute for device firmware thermal protection. The policy is a first milestone and will be tuned with real mixed-device benchmarks.
 
 ## Platform reality
 
