@@ -1,4 +1,4 @@
-"""Opt-in worker agent. It shares bounded inference only; no remote shell or file access."""
+"""Opt-in MeshLLM worker. It shares bounded inference only; no remote shell or file access."""
 from __future__ import annotations
 
 import argparse
@@ -54,14 +54,17 @@ async def main() -> None:
     parser.add_argument("--server", required=True, help="Coordinator URL, e.g. http://192.168.1.10:8765")
     parser.add_argument("--name", default=platform.node())
     parser.add_argument("--ollama-url", default=None, help="Local Ollama URL, e.g. http://127.0.0.1:11434")
+    parser.add_argument("--rpc-endpoint", default=None, help="Manually configured llama.cpp RPC endpoint, e.g. 192.168.1.22:50052")
+    parser.add_argument("--max-parallel-jobs", type=int, default=1, choices=range(1, 17))
     args = parser.parse_args()
 
     print("MeshLLM worker — explicit opt-in")
     print(f"Device: {args.name} ({platform.system()} {platform.machine()})")
     print(f"CPU threads: {os.cpu_count() or 1}; RAM: {memory_mb()} MB")
     print(f"GPU detected: {gpu_name() or 'not detected'}")
-    print("Only bounded Ollama inference requests are shared. No shell or file access is provided.")
-    if input("Join this coordinator and allow inference workloads on this device? [y/N] ").strip().lower() not in {"y", "yes"}:
+    print(f"Ollama: {args.ollama_url or 'disabled'}; llama.cpp RPC: {args.rpc_endpoint or 'not configured'}")
+    print("RPC exposes compute, not a secure authenticated tunnel. Use only on a trusted isolated LAN.")
+    if input("Join this coordinator and allow the configured workloads? [y/N] ").strip().lower() not in {"y", "yes"}:
         print("Not joining. No resources will be shared.")
         return
 
@@ -74,15 +77,17 @@ async def main() -> None:
         response = await client.post(base + "/api/workers/register", json={
             "name": args.name, "platform": f"{platform.system()} {platform.machine()}",
             "cpu_threads": os.cpu_count() or 1, "ram_mb": memory_mb(),
-            "gpu_name": gpu_name(), "runtimes": ["ollama"] if args.ollama_url else [],
-            "ollama_url": args.ollama_url, "pairing_token": pairing_token,
+            "gpu_name": gpu_name(),
+            "runtimes": (["ollama"] if args.ollama_url else []) + (["llama.cpp-rpc"] if args.rpc_endpoint else []),
+            "ollama_url": args.ollama_url, "rpc_endpoint": args.rpc_endpoint,
+            "max_parallel_jobs": args.max_parallel_jobs, "pairing_token": pairing_token,
         })
         response.raise_for_status()
         worker_id = response.json()["worker_id"]
         print(f"Joined. Worker ID: {worker_id}. Press Ctrl+C to leave.")
         try:
             while True:
-                await client.post(base + f"/api/workers/{worker_id}/heartbeat", json={"busy": False})
+                await client.post(base + f"/api/workers/{worker_id}/heartbeat")
                 await asyncio.sleep(10)
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
