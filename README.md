@@ -87,3 +87,18 @@ The coordinator and Python worker can run on Windows, Linux and Android/Termux w
 The dashboard shows the build/instance timestamp in UTC, converted to the viewer's local timezone, plus the live server time. Set `MESHELL_BUILD_TIMESTAMP` to an ISO-8601 UTC timestamp in deployments to preserve the exact artifact build time; without it, the coordinator records its process initialization time.
 
 Run tests with `pip install -r requirements-dev.txt && pytest`.
+
+## Android application (first client target)
+
+A native Kotlin + Jetpack Compose Android project is being added under `android/`. Open that directory in Android Studio and sync the Gradle project. The initial UI prototype establishes the intended operator workflow:
+
+- Connection mode: Off, Master or Worker.
+- Master-oriented connected-device selection and QR pairing entry points.
+- Model lifecycle: Load, then Start, then Chat.
+- Local-only versus selected cluster devices.
+- Automatic allocation by default, with a manual per-device share control.
+- Context-token configuration entry point.
+
+**Current implementation status:** this is the Android UI foundation, not a functioning Android inference client yet. Device rows are illustrative placeholders; QR camera scanning, live Wi-Fi discovery/transport, pairing API integration, model downloads/loaders, real resource measurement, allocation enforcement and chat inference still need implementation. The existing Python coordinator remains the current working cluster backend. Android is the first native client; Windows remains a later target.
+
+The app uses Android API 26+ and Java 17. It currently permits cleartext traffic for trusted-LAN development; production deployment must use authenticated transport encryption and should not expose the coordinator or worker endpoints to public networks.
