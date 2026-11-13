@@ -23,11 +23,13 @@ pip install -r requirements.txt
 uvicorn meshllm.server:app --host 0.0.0.0 --port 8765
 ```
 
-Open `http://127.0.0.1:8765`, generate a one-time pairing token, and start each worker manually:
+Open `http://127.0.0.1:8765`. Start each worker manually; it creates a short-lived QR enrollment request and prints the QR in the terminal:
 
 ```bash
 python -m meshllm.worker --server http://COORDINATOR_IP:8765 --name "Laptop" --ollama-url http://127.0.0.1:11434 --max-parallel-jobs 2
 ```
+
+Scan the terminal QR with the cluster owner's phone and tap **Approve this device** on the confirmation page. The worker waits for approval and only registers after approval. QR requests expire after five minutes and are single-use. No pairing token is typed or displayed as a separate code. Use HTTPS where possible; on plain HTTP, the approval URL is a temporary bearer credential and must stay on a trusted LAN.
 
 For a worker that also runs a separately configured llama.cpp RPC server:
 
@@ -48,8 +50,11 @@ llama.cpp distributes model weights and KV cache across available devices by mem
 ## API
 
 - `GET /api/health`
-- `POST /api/pairing-token`
-- `POST /api/workers/register`
+- `POST /api/pairing-sessions`
+- `GET /api/pairing-sessions/{session_id}/status`
+- `POST /api/pairing-sessions/{session_id}/approve`
+- `GET /pair/approve/{session_id}`
+- `POST /api/workers/register` — requires a single-use, owner-approved QR session
 - `POST /api/workers/{worker_id}/heartbeat`
 - `POST /api/workers/{worker_id}/leave`
 - `GET /api/workers` — includes latest telemetry, eligibility and scheduler score
@@ -72,5 +77,7 @@ The coordinator continuously ranks available Ollama workers using free-memory he
 The coordinator and Python worker can run on Windows, Linux and Android/Termux where Python and the dependencies are available. Actual GPU acceleration depends on the separately built inference runtime and drivers. A phone may contribute CPU/RAM to compatible backends, but it is not automatically a CUDA/Metal device. Heterogeneous pooling is best-effort and network bandwidth/latency can make a cluster slower than one machine.
 
 ## Development
+
+The dashboard shows the build/instance timestamp in UTC, converted to the viewer's local timezone, plus the live server time. Set `MESHELL_BUILD_TIMESTAMP` to an ISO-8601 UTC timestamp in deployments to preserve the exact artifact build time; without it, the coordinator records its process initialization time.
 
 Run tests with `pip install -r requirements-dev.txt && pytest`.
