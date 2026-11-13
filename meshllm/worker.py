@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import glob
+import hashlib
 import os
 import platform
 import subprocess
@@ -190,11 +191,24 @@ def temperature_c() -> float | None:
         return None
 
 
+def cpu_benchmark_score() -> float | None:
+    """Small repeatable CPU throughput probe; not a substitute for model benchmarks."""
+    rounds = 40_000
+    started = time.perf_counter()
+    try:
+        hashlib.pbkdf2_hmac("sha256", b"MeshLLM CPU benchmark", b"meshllm-v1", rounds)
+        elapsed = max(time.perf_counter() - started, 0.000001)
+        return round(rounds / elapsed, 1)
+    except Exception:
+        return None
+
+
 def collect_telemetry() -> dict:
     telemetry = {
         "available_ram_mb": available_memory_mb(),
         "cpu_percent": cpu_percent(),
         "temperature_c": temperature_c(),
+        "cpu_benchmark_score": cpu_benchmark_score(),
     }
     telemetry.update(gpu_metrics())
     telemetry.update(battery_metrics())
@@ -267,9 +281,19 @@ async def main() -> None:
         print(f"Joined. Worker ID: {worker_id}. Press Ctrl+C to leave.")
         try:
             while True:
+                heartbeat_metrics = collect_telemetry()
+                started = time.perf_counter()
                 await client.post(
                     base + f"/api/workers/{worker_id}/heartbeat",
-                    json=collect_telemetry(),
+                    json=heartbeat_metrics,
+                )
+                heartbeat_metrics["network_rtt_ms"] = round(
+                    (time.perf_counter() - started) * 1000, 2
+                )
+                # Include measured round-trip time in the next heartbeat.
+                await client.post(
+                    base + f"/api/workers/{worker_id}/heartbeat",
+                    json={"network_rtt_ms": heartbeat_metrics["network_rtt_ms"]},
                 )
                 await asyncio.sleep(10)
         except (KeyboardInterrupt, asyncio.CancelledError):
