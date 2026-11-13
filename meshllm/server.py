@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import secrets
 import shlex
 import time
@@ -242,7 +243,7 @@ async def distributed_plan(req: DistributedPlanRequest) -> dict[str, Any]:
             values = [float(part) for part in parts]
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="tensor_split must be comma-separated numbers") from exc
-        if len(values) != len(endpoints) + 1 or any(v <= 0 for v in values):
+        if len(values) != len(endpoints) + 1 or any(not math.isfinite(v) or v <= 0 for v in values):
             raise HTTPException(status_code=422, detail="tensor_split needs one positive value per RPC worker plus the local host")
         args.extend(["--tensor-split", req.tensor_split])
     return {
