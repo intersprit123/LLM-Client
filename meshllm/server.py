@@ -221,42 +221,48 @@ def _worker_is_eligible(worker: Worker) -> bool:
 
 
 async def _run_job(job: Job, max_tokens: int) -> None:
-    selected: Worker | None = None
-    async with lock:
-        candidates = [w for w in workers.values() if _worker_is_eligible(w)]
-        candidates.sort(key=lambda w: (-_worker_score(w), w.name.lower()))
-        if candidates:
-            selected = candidates[0]
-            job.scheduler_score = _worker_score(selected)
-            selected.active_jobs += 1
-            job.worker_id = selected.worker_id
-            job.scheduler_decision = (
-                "Selected highest health-aware capacity score; "
-                "thermal and critical-battery limits were applied."
-            )
-            job.status = "running"
-
-    if selected is None:
-        job.status = "failed"
-        job.error = "No available opted-in Ollama worker. Check worker status and concurrency limits."
-        return
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=5.0)) as client:
-            response = await client.post(
-                selected.ollama_url.rstrip("/") + "/api/generate",
-                json={"model": job.model, "prompt": job.prompt, "stream": False,
-                      "options": {"num_predict": max_tokens}},
-            )
-            response.raise_for_status()
-            job.response = str(response.json().get("response", ""))
-            job.status = "completed"
-    except (httpx.HTTPError, ValueError) as exc:
-        job.status = "failed"
-        job.error = f"Inference request failed: {type(exc).__name__}: {exc}"
-    finally:
+    attempted: set[str] = set()
+    last_error = "No available opted-in Ollama worker."
+    while True:
+        selected: Worker | None = None
         async with lock:
-            selected.active_jobs = max(0, selected.active_jobs - 1)
+            candidates = [
+                w for w in workers.values()
+                if w.worker_id not in attempted and _worker_is_eligible(w)
+            ]
+            candidates.sort(key=lambda w: (-_worker_score(w), w.name.lower()))
+            if candidates:
+                selected = candidates[0]
+                attempted.add(selected.worker_id)
+                job.scheduler_score = _worker_score(selected)
+                selected.active_jobs += 1
+                job.worker_id = selected.worker_id
+                job.scheduler_decision = (
+                    "Selected highest health-aware score. Failed workers are skipped "
+                    "and the next eligible worker is tried automatically."
+                )
+                job.status = "running"
+        if selected is None:
+            job.status = "failed"
+            job.error = last_error
+            return
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=5.0)) as client:
+                response = await client.post(
+                    selected.ollama_url.rstrip("/") + "/api/generate",
+                    json={"model": job.model, "prompt": job.prompt, "stream": False,
+                          "options": {"num_predict": max_tokens}},
+                )
+                response.raise_for_status()
+                job.response = str(response.json().get("response", ""))
+                job.status = "completed"
+                job.error = None
+                return
+        except (httpx.HTTPError, ValueError) as exc:
+            last_error = f"{selected.name} failed: {type(exc).__name__}: {exc}"
+        finally:
+            async with lock:
+                selected.active_jobs = max(0, selected.active_jobs - 1)
 
 
 @asynccontextmanager
