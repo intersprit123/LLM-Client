@@ -312,3 +312,24 @@ def test_gpu_benchmark_score_is_stored_and_used_by_scheduler():
         assert registration.status_code == 200
         worker = client.get("/api/workers").json()[0]
         assert worker["gpu_benchmark_score"] == 85000.0
+
+
+
+def test_network_probe_returns_no_cache_payload_for_bandwidth_measurement():
+    with TestClient(app) as client:
+        response = client.get("/api/network/probe")
+        assert response.status_code == 200
+        assert len(response.content) == 131072
+        assert response.headers["cache-control"] == "no-store"
+
+
+def test_worker_network_bandwidth_metric_is_accepted():
+    with TestClient(app) as client:
+        registration = register(client, network_mbps=85.2).json()
+        response = client.post(
+            f"/api/workers/{registration['worker_id']}/heartbeat",
+            headers={"X-Worker-Token": registration["worker_token"]},
+            json={"network_mbps": 92.4},
+        )
+        assert response.status_code == 200
+        assert client.get("/api/workers").json()[0]["network_mbps"] == 92.4
