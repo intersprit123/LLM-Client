@@ -242,3 +242,17 @@ def test_manual_tensor_split_overrides_automatic_split():
         assert response.status_code == 200
         assert response.json()["tensor_split"] == "2,1"
         assert response.json()["tensor_split_source"] == "manual"
+
+
+
+def test_heartbeat_records_network_rtt_and_cpu_benchmark():
+    with TestClient(app) as client:
+        worker_id = register(client, cpu_benchmark_score=180000.0).json()["worker_id"]
+        response = client.post(
+            f"/api/workers/{worker_id}/heartbeat",
+            json={"network_rtt_ms": 42.5, "cpu_benchmark_score": 190000.0},
+        )
+        assert response.status_code == 200
+        worker = client.get("/api/workers").json()[0]
+        assert worker["network_rtt_ms"] == 42.5
+        assert worker["cpu_benchmark_score"] == 190000.0
