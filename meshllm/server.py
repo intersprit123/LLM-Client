@@ -1,0 +1,243 @@
+"""MeshLLM coordinator API.
+
+The coordinator never executes arbitrary code on workers. It schedules bounded
+inference requests to workers that explicitly joined the pool.
+"""
+from __future__ import annotations
+
+import asyncio
+import secrets
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
+
+PAIR_TTL_SECONDS = 300
+HEARTBEAT_TIMEOUT_SECONDS = 30
+MAX_PROMPT_CHARS = 16_000
+MAX_OUTPUT_TOKENS = 2048
+
+
+@dataclass
+class Worker:
+    worker_id: str
+    name: str
+    platform: str
+    cpu_threads: int
+    ram_mb: int
+    gpu_name: str | None
+    runtimes: list[str]
+    ollama_url: str | None
+    joined_at: float
+    last_seen: float
+    busy: bool = False
+    enabled: bool = True
+
+
+@dataclass
+class Job:
+    job_id: str
+    model: str
+    prompt: str
+    status: str
+    created_at: float
+    worker_id: str | None = None
+    response: str | None = None
+    error: str | None = None
+
+
+class PairRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    platform: str = Field(min_length=1, max_length=40)
+    cpu_threads: int = Field(ge=1, le=512)
+    ram_mb: int = Field(ge=128, le=2_000_000)
+    gpu_name: str | None = Field(default=None, max_length=128)
+    runtimes: list[str] = Field(default_factory=list, max_length=16)
+    ollama_url: str | None = Field(default=None, max_length=256)
+    pairing_token: str = Field(min_length=16, max_length=128)
+
+
+class HeartbeatRequest(BaseModel):
+    busy: bool = False
+
+
+class JobRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=128)
+    prompt: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
+    max_tokens: int = Field(default=512, ge=1, le=MAX_OUTPUT_TOKENS)
+
+
+workers: dict[str, Worker] = {}
+jobs: dict[str, Job] = {}
+pair_tokens: dict[str, float] = {}
+lock = asyncio.Lock()
+
+
+async def _mark_stale() -> None:
+    now = time.time()
+    async with lock:
+        for worker in workers.values():
+            if now - worker.last_seen > HEARTBEAT_TIMEOUT_SECONDS:
+                worker.enabled = False
+
+
+async def _run_job(job: Job, max_tokens: int) -> None:
+    selected: Worker | None = None
+    async with lock:
+        candidates = [w for w in workers.values() if w.enabled and not w.busy and w.ollama_url]
+        candidates.sort(key=lambda w: (-w.ram_mb, w.name.lower()))
+        if candidates:
+            selected = candidates[0]
+            selected.busy = True
+            job.worker_id = selected.worker_id
+            job.status = "running"
+
+    if selected is None:
+        job.status = "failed"
+        job.error = "No opted-in worker with an Ollama endpoint is currently available."
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=5.0)) as client:
+            response = await client.post(
+                selected.ollama_url.rstrip("/") + "/api/generate",
+                json={"model": job.model, "prompt": job.prompt, "stream": False,
+                      "options": {"num_predict": max_tokens}},
+            )
+            response.raise_for_status()
+            job.response = str(response.json().get("response", ""))
+            job.status = "completed"
+    except (httpx.HTTPError, ValueError) as exc:
+        job.status = "failed"
+        job.error = f"Inference request failed: {type(exc).__name__}: {exc}"
+    finally:
+        async with lock:
+            selected.busy = False
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+
+
+app = FastAPI(title="MeshLLM Coordinator", version="0.1.0", lifespan=lifespan)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard() -> str:
+    return DASHBOARD
+
+
+@app.get("/api/health")
+async def health() -> dict[str, Any]:
+    await _mark_stale()
+    async with lock:
+        return {"status": "ok", "workers": len(workers),
+                "online_workers": sum(w.enabled for w in workers.values()), "jobs": len(jobs)}
+
+
+@app.post("/api/pairing-token")
+async def create_pairing_token() -> dict[str, Any]:
+    token = secrets.token_urlsafe(24)
+    pair_tokens[token] = time.time() + PAIR_TTL_SECONDS
+    return {"pairing_token": token, "expires_in_seconds": PAIR_TTL_SECONDS}
+
+
+@app.post("/api/workers/register")
+async def register_worker(req: PairRequest) -> dict[str, Any]:
+    expiry = pair_tokens.pop(req.pairing_token, None)
+    if expiry is None or expiry < time.time():
+        raise HTTPException(status_code=401, detail="Invalid or expired pairing token")
+    worker_id = str(uuid.uuid4())
+    now = time.time()
+    worker = Worker(worker_id, req.name, req.platform, req.cpu_threads, req.ram_mb,
+                    req.gpu_name, req.runtimes, req.ollama_url, now, now)
+    async with lock:
+        workers[worker_id] = worker
+    return {"worker_id": worker_id, "heartbeat_interval_seconds": 10}
+
+
+@app.post("/api/workers/{worker_id}/heartbeat")
+async def heartbeat(worker_id: str, req: HeartbeatRequest) -> dict[str, bool]:
+    async with lock:
+        worker = workers.get(worker_id)
+        if worker is None:
+            raise HTTPException(status_code=404, detail="Unknown worker")
+        worker.last_seen = time.time()
+        worker.enabled = True
+        worker.busy = req.busy
+    return {"ok": True}
+
+
+@app.post("/api/workers/{worker_id}/leave")
+async def leave_worker(worker_id: str) -> dict[str, bool]:
+    async with lock:
+        worker = workers.pop(worker_id, None)
+    if worker is None:
+        raise HTTPException(status_code=404, detail="Unknown worker")
+    return {"ok": True}
+
+
+@app.get("/api/workers")
+async def list_workers() -> list[dict[str, Any]]:
+    await _mark_stale()
+    async with lock:
+        return [{**asdict(w), "online": w.enabled,
+                 "last_seen_ago_seconds": round(time.time() - w.last_seen, 1)}
+                for w in workers.values()]
+
+
+@app.post("/api/jobs")
+async def submit_job(req: JobRequest) -> dict[str, str]:
+    job = Job(str(uuid.uuid4()), req.model, req.prompt, "queued", time.time())
+    async with lock:
+        jobs[job.job_id] = job
+    asyncio.create_task(_run_job(job, req.max_tokens))
+    return {"job_id": job.job_id, "status": job.status}
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str) -> dict[str, Any]:
+    async with lock:
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Unknown job")
+        return asdict(job)
+
+
+DASHBOARD = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MeshLLM</title><style>
+:root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#0b1020;color:#e8edff}
+body{max-width:1050px;margin:40px auto;padding:0 20px}h1{font-size:2.2rem;margin-bottom:4px}
+p{color:#9ca9c9}.card{background:#151d33;border:1px solid #293653;border-radius:16px;padding:20px;margin:16px 0}
+.row{display:flex;gap:12px;flex-wrap:wrap}.stat{min-width:130px;flex:1}
+.big{font-size:2rem;font-weight:700}button{background:#6d83ff;color:white;border:0;padding:11px 16px;border-radius:9px;cursor:pointer}
+input,textarea{background:#0e1528;color:#e8edff;border:1px solid #344365;border-radius:8px;padding:10px;width:100%;box-sizing:border-box;margin:6px 0 12px}
+textarea{min-height:110px}code{color:#aab8ff}.muted{font-size:.9rem;color:#9ca9c9}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px;border-bottom:1px solid #293653}
+</style></head><body>
+<h1>MeshLLM <span class="muted">0.1</span></h1><p>Opt-in AI compute pool · trusted local network</p>
+<div class="card row"><div class="stat"><div class="big" id="online">0</div><div class="muted">Online workers</div></div>
+<div class="stat"><div class="big" id="total">0</div><div class="muted">Registered workers</div></div>
+<div class="stat"><div class="big" id="jobs">0</div><div class="muted">Jobs tracked</div></div></div>
+<div class="card"><h2>Pair a device</h2><p>Create a short-lived token, then enter it into a worker started by its owner.</p>
+<button onclick="token()">Generate pairing token</button><p id="token" class="big"></p><p class="muted">Treat this token like a password. It expires in five minutes and can be used once.</p></div>
+<div class="card"><h2>Workers</h2><table><thead><tr><th>Name</th><th>Platform</th><th>CPU threads</th><th>RAM</th><th>GPU</th><th>Status</th></tr></thead><tbody id="workers"></tbody></table></div>
+<div class="card"><h2>Submit inference</h2><label>Model (must be installed in worker Ollama)</label><input id="model" value="llama3.2"><label>Prompt</label><textarea id="prompt" placeholder="Ask the model something..."></textarea><button onclick="submitJob()">Run inference</button><pre id="result"></pre></div>
+<script>
+async function refresh(){try{let [h,w]=await Promise.all([fetch('/api/health').then(r=>r.json()),fetch('/api/workers').then(r=>r.json())]);
+document.getElementById('online').textContent=h.online_workers;document.getElementById('total').textContent=h.workers;document.getElementById('jobs').textContent=h.jobs;
+document.getElementById('workers').innerHTML=w.map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.platform)+'</td><td>'+x.cpu_threads+'</td><td>'+Math.round(x.ram_mb/1024)+' GB</td><td>'+esc(x.gpu_name||'—')+'</td><td>'+(x.online?'Online':'Offline')+'</td></tr>').join('')||'<tr><td colspan="6">No workers paired yet.</td></tr>';
+}catch(e){}}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function token(){let r=await fetch('/api/pairing-token',{method:'POST'});let x=await r.json();document.getElementById('token').textContent=x.pairing_token;}
+async function submitJob(){let out=document.getElementById('result');out.textContent='Submitting...';let r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:document.getElementById('model').value,prompt:document.getElementById('prompt').value})});let x=await r.json();if(!r.ok){out.textContent=JSON.stringify(x);return;}out.textContent='Job '+x.job_id+' queued...';let timer=setInterval(async()=>{let j=await fetch('/api/jobs/'+x.job_id).then(r=>r.json());if(j.status==='completed'||j.status==='failed'){clearInterval(timer);out.textContent=j.status==='completed'?j.response:(j.error||'Failed');}},1000);}
+refresh();setInterval(refresh,4000);
+</script></body></html>"""
