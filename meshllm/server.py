@@ -557,6 +557,32 @@ async def distributed_plan(req: DistributedPlanRequest) -> dict[str, Any]:
         "note": "Automatic proportions are planning estimates based on coordinator memory input and worker free VRAM/RAM telemetry. Review against actual backend devices and model requirements before running. The command is not executed. llama.cpp RPC is proof-of-concept and insecure; use only on a trusted isolated LAN.",
     }
 
+@app.post("/api/hybrid/plan")
+async def hybrid_plan(req: DistributedPlanRequest) -> dict[str, Any]:
+    """Describe a hybrid pool: one sharded model plus independent request workers."""
+    shard_plan = await distributed_plan(req)
+    async with lock:
+        parallel = sorted(
+            [w for w in workers.values() if _worker_is_eligible(w)],
+            key=lambda w: (-_worker_score(w), w.name.lower()),
+        )
+        rpc_ids = {w.worker_id for w in workers.values() if w.enabled and w.rpc_endpoint}
+    return {
+        "mode": "hybrid",
+        "model_sharding": shard_plan,
+        "parallel_inference_workers": [
+            {"worker_id": w.worker_id, "name": w.name, "score": _worker_score(w)}
+            for w in parallel if w.worker_id not in rpc_ids
+        ],
+        "orchestration": {
+            "sharded_model": "one llama.cpp RPC model server",
+            "parallel_requests": "independent Ollama workers",
+            "execution": "plan_only",
+        },
+        "note": "This combines both compute modes in one reviewed orchestration plan. It does not start processes or yet route live requests between the two backends.",
+    }
+
+
 DASHBOARD = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MeshLLM</title><style>
