@@ -136,6 +136,8 @@ class DistributedPlanRequest(BaseModel):
     port: int = Field(default=8080, ge=1024, le=65535)
     parallel_slots: int = Field(default=2, ge=1, le=32)
     tensor_split: str | None = Field(default=None, max_length=256)
+    auto_tensor_split: bool = True
+    local_memory_mb: int = Field(default=4096, ge=256, le=2_000_000)
 
 
 workers: dict[str, Worker] = {}
@@ -447,25 +449,57 @@ async def get_job(job_id: str) -> dict[str, Any]:
 
 @app.post("/api/distributed/plan")
 async def distributed_plan(req: DistributedPlanRequest) -> dict[str, Any]:
-    """Build a llama.cpp launch plan; never starts a process or opens RPC ports."""
+    """Build a resource-aware llama.cpp launch plan; never starts a process."""
     await _mark_stale()
     async with lock:
-        endpoints = sorted({w.rpc_endpoint for w in workers.values()
-                            if w.enabled and w.rpc_endpoint})
+        rpc_workers = sorted(
+            [w for w in workers.values() if w.enabled and w.rpc_endpoint],
+            key=lambda w: w.name.lower(),
+        )
+    endpoints = [w.rpc_endpoint for w in rpc_workers if w.rpc_endpoint]
     if not endpoints:
         raise HTTPException(status_code=409, detail="No online worker has advertised a llama.cpp RPC endpoint")
     args = ["llama-server", "-m", req.model_path, "--host", req.host,
             "--port", str(req.port), "-np", str(req.parallel_slots),
             "--rpc", ",".join(endpoints)]
-    if req.tensor_split:
-        # Numeric comma-separated proportions only; avoid shell injection.
-        parts = req.tensor_split.split(",")
+    selected_split = req.tensor_split
+    split_source = "manual"
+    memory_estimates: list[dict[str, Any]] = []
+    if selected_split:
+        parts = selected_split.split(",")
         try:
             values = [float(part) for part in parts]
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="tensor_split must be comma-separated numbers") from exc
         if len(values) != len(endpoints) + 1 or any(not math.isfinite(v) or v <= 0 for v in values):
             raise HTTPException(status_code=422, detail="tensor_split needs one positive value per RPC worker plus the local host")
+    elif req.auto_tensor_split:
+        capacities = [float(req.local_memory_mb)]
+        memory_estimates.append({"device": "coordinator", "usable_memory_mb": req.local_memory_mb})
+        for worker in rpc_workers:
+            # Prefer free VRAM for GPU RPC workers; fall back to available system RAM.
+            usable = worker.gpu_mem_free_mb
+            source = "free_vram"
+            if usable is None or usable <= 0:
+                usable = worker.available_ram_mb
+                source = "available_ram"
+            if usable is None or usable <= 0:
+                usable = max(256, worker.ram_mb // 2)
+                source = "estimated_half_total_ram"
+            capacities.append(float(max(256, usable)))
+            memory_estimates.append({
+                "device": worker.name, "usable_memory_mb": int(max(256, usable)),
+                "source": source, "temperature_c": worker.temperature_c,
+                "network_rtt_ms": getattr(worker, "network_rtt_ms", None),
+            })
+        total = sum(capacities)
+        values = [value / total for value in capacities]
+        selected_split = ",".join(f"{value:.4f}" for value in values)
+        args.extend(["--tensor-split", selected_split])
+        split_source = "automatic_memory_estimate"
+    else:
+        values = []
+    if req.tensor_split:
         args.extend(["--tensor-split", req.tensor_split])
     return {
         "backend": "llama.cpp RPC",
@@ -473,9 +507,11 @@ async def distributed_plan(req: DistributedPlanRequest) -> dict[str, Any]:
         "command": shlex.join(args),
         "argv": args,
         "parallel_slots": req.parallel_slots,
-        "note": "Review the command before running. llama.cpp RPC is proof-of-concept and insecure; use only on a trusted isolated LAN. The model file must be accessible on the coordinator.",
+        "tensor_split": selected_split,
+        "tensor_split_source": split_source,
+        "memory_estimates": memory_estimates,
+        "note": "Automatic proportions are planning estimates based on coordinator memory input and worker free VRAM/RAM telemetry. Review against actual backend devices and model requirements before running. The command is not executed. llama.cpp RPC is proof-of-concept and insecure; use only on a trusted isolated LAN.",
     }
-
 
 DASHBOARD = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
