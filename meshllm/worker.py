@@ -11,6 +11,7 @@ import sys
 import time
 
 import httpx
+import qrcode
 
 
 def memory_mb() -> int:
@@ -220,24 +221,46 @@ async def main() -> None:
     print(f"Temperature: {telemetry.get('temperature_c', 'unknown')}°C; "
           f"battery: {telemetry.get('battery_percent', 'unknown')}%")
     print(f"Ollama: {args.ollama_url or 'disabled'}; llama.cpp RPC: {args.rpc_endpoint or 'not configured'}")
-    print("RPC exposes compute, not a secure authenticated tunnel. Use only on a trusted isolated LAN.")
-    if input("Join this coordinator and allow the configured workloads? [y/N] ").strip().lower() not in {"y", "yes"}:
-        print("Not joining. No resources will be shared.")
-        return
-
-    pairing_token = input("Paste one-time pairing token: ").strip()
-    if len(pairing_token) < 16:
-        raise SystemExit("Pairing token looks invalid.")
-
+    print("QR approval required. No worker joins until the cluster owner approves it.")
     base = args.server.rstrip("/")
+    metadata = {
+        "name": args.name, "platform": f"{platform.system()} {platform.machine()}",
+        "cpu_threads": os.cpu_count() or 1, "ram_mb": memory_mb(),
+        "gpu_name": detected_gpu, **telemetry,
+        "runtimes": (["ollama"] if args.ollama_url else []) + (["llama.cpp-rpc"] if args.rpc_endpoint else []),
+        "ollama_url": args.ollama_url, "rpc_endpoint": args.rpc_endpoint,
+        "max_parallel_jobs": args.max_parallel_jobs,
+    }
     async with httpx.AsyncClient(timeout=10.0) as client:
+        session_response = await client.post(base + "/api/pairing-sessions", json=metadata)
+        session_response.raise_for_status()
+        session = session_response.json()
+        approval_url = base + session["approval_path"] + "?worker_secret=" + session["worker_secret"]
+        qr = qrcode.QRCode(border=2)
+        qr.add_data(approval_url)
+        qr.make(fit=True)
+        print("\\nScan this QR with the cluster owner's phone, then tap Approve:")
+        qr.print_ascii(out=sys.stdout)
+        print(f"Waiting for approval (expires in {session['expires_in_seconds']} seconds)...")
+        deadline = time.monotonic() + session["expires_in_seconds"]
+        while time.monotonic() < deadline:
+            status_response = await client.get(
+                base + f"/api/pairing-sessions/{session['session_id']}/status",
+                params={"worker_secret": session["worker_secret"]},
+            )
+            if status_response.status_code == 410:
+                raise SystemExit("QR approval expired. Restart the worker to create a new QR.")
+            status_response.raise_for_status()
+            if status_response.json()["status"] == "approved":
+                break
+            await asyncio.sleep(2)
+        else:
+            raise SystemExit("QR approval timed out. Restart the worker to create a new QR.")
+
         response = await client.post(base + "/api/workers/register", json={
-            "name": args.name, "platform": f"{platform.system()} {platform.machine()}",
-            "cpu_threads": os.cpu_count() or 1, "ram_mb": memory_mb(),
-            "gpu_name": detected_gpu, **telemetry,
-            "runtimes": (["ollama"] if args.ollama_url else []) + (["llama.cpp-rpc"] if args.rpc_endpoint else []),
-            "ollama_url": args.ollama_url, "rpc_endpoint": args.rpc_endpoint,
-            "max_parallel_jobs": args.max_parallel_jobs, "pairing_token": pairing_token,
+            **metadata,
+            "pairing_session_id": session["session_id"],
+            "worker_secret": session["worker_secret"],
         })
         response.raise_for_status()
         worker_id = response.json()["worker_id"]
