@@ -53,6 +53,7 @@ class Worker:
     battery_plugged: bool | None
     temperature_c: float | None
     cpu_benchmark_score: float | None
+    gpu_benchmark_score: float | None
     network_rtt_ms: float | None
     metrics_updated_at: float | None
     joined_at: float
@@ -93,6 +94,7 @@ class PairRequest(BaseModel):
     battery_plugged: bool | None = None
     temperature_c: float | None = Field(default=None, ge=-20, le=150)
     cpu_benchmark_score: float | None = Field(default=None, ge=0, le=10_000_000)
+    gpu_benchmark_score: float | None = Field(default=None, ge=0, le=10_000_000)
     network_rtt_ms: float | None = Field(default=None, ge=0, le=60_000)
     pairing_session_id: str = Field(min_length=16, max_length=128)
     worker_secret: str = Field(min_length=32, max_length=128)
@@ -201,8 +203,12 @@ def _worker_score(worker: Worker) -> float:
         if worker.network_rtt_ms is not None else 0.75
     )
     benchmark_bonus = (
-        0.04 * min(1.0, worker.cpu_benchmark_score / 250_000.0)
+        0.025 * min(1.0, worker.cpu_benchmark_score / 250_000.0)
         if worker.cpu_benchmark_score is not None else 0.0
+    )
+    gpu_benchmark_bonus = (
+        0.035 * min(1.0, worker.gpu_benchmark_score / 100_000.0)
+        if worker.gpu_benchmark_score is not None else 0.0
     )
     base = (
         0.32 * memory_headroom
@@ -211,7 +217,7 @@ def _worker_score(worker: Worker) -> float:
         + 0.08 * battery_headroom
         + 0.12 * network_headroom
     )
-    return round(min(1.0, base * thermal_headroom + gpu_bonus + benchmark_bonus), 4)
+    return round(min(1.0, base * thermal_headroom + gpu_bonus + benchmark_bonus + gpu_benchmark_bonus), 4)
 
 
 def _worker_exclusion_reason(worker: Worker) -> str | None:
@@ -388,12 +394,13 @@ async def register_worker(req: PairRequest) -> dict[str, Any]:
         gpu_mem_total_mb=req.gpu_mem_total_mb, gpu_mem_free_mb=req.gpu_mem_free_mb,
         gpu_util_percent=req.gpu_util_percent, battery_percent=req.battery_percent,
         battery_plugged=req.battery_plugged, temperature_c=req.temperature_c,
-        cpu_benchmark_score=req.cpu_benchmark_score, network_rtt_ms=req.network_rtt_ms,
+        cpu_benchmark_score=req.cpu_benchmark_score, gpu_benchmark_score=req.gpu_benchmark_score,
+        network_rtt_ms=req.network_rtt_ms,
         metrics_updated_at=now if any(value is not None for value in (
             req.available_ram_mb, req.cpu_percent, req.gpu_mem_total_mb,
             req.gpu_mem_free_mb, req.gpu_util_percent, req.battery_percent,
             req.battery_plugged, req.temperature_c, req.cpu_benchmark_score,
-            req.network_rtt_ms
+            req.network_rtt_ms, req.gpu_benchmark_score
         )) else None,
         joined_at=now, last_seen=now,
     )
