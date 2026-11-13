@@ -276,6 +276,16 @@ async def main() -> None:
         "max_parallel_jobs": args.max_parallel_jobs,
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            probe_started = time.perf_counter()
+            probe = await client.get(base + "/api/network/probe")
+            probe.raise_for_status()
+            elapsed = max(time.perf_counter() - probe_started, 0.000001)
+            metadata["network_mbps"] = round((len(probe.content) * 8) / elapsed / 1_000_000, 2)
+            telemetry["network_mbps"] = metadata["network_mbps"]
+            print(f"Coordinator link estimate: {metadata['network_mbps']} Mbps")
+        except httpx.HTTPError:
+            print("Coordinator link estimate: unavailable")
         session_response = await client.post(base + "/api/pairing-sessions", json=metadata)
         session_response.raise_for_status()
         session = session_response.json()
