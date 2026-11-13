@@ -1,7 +1,9 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from meshllm.server import app, jobs, pair_tokens, workers
+from meshllm.server import (
+    app, jobs, pair_tokens, workers, _worker_is_eligible, _worker_score,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -88,3 +90,81 @@ def test_tensor_split_rejects_non_finite_values():
             "model_path": "model.gguf", "tensor_split": "1,nan"
         })
         assert response.status_code == 422
+
+
+
+def test_registration_stores_initial_telemetry():
+    with TestClient(app) as client:
+        response = register(
+            client, available_ram_mb=2500, cpu_percent=23.5,
+            gpu_mem_total_mb=8192, gpu_mem_free_mb=6000,
+            gpu_util_percent=18, battery_percent=88,
+            battery_plugged=True, temperature_c=48.2,
+        )
+        assert response.status_code == 200
+        worker = client.get("/api/workers").json()[0]
+        assert worker["available_ram_mb"] == 2500
+        assert worker["cpu_percent"] == 23.5
+        assert worker["gpu_mem_free_mb"] == 6000
+        assert worker["battery_plugged"] is True
+        assert worker["temperature_c"] == 48.2
+        assert worker["metrics_age_seconds"] is not None
+
+
+def test_heartbeat_updates_live_telemetry():
+    with TestClient(app) as client:
+        response = register(client)
+        worker_id = response.json()["worker_id"]
+        heartbeat = client.post(
+            f"/api/workers/{worker_id}/heartbeat",
+            json={"available_ram_mb": 1536, "cpu_percent": 71.0, "temperature_c": 67.5},
+        )
+        assert heartbeat.status_code == 200
+        worker = client.get("/api/workers").json()[0]
+        assert worker["available_ram_mb"] == 1536
+        assert worker["cpu_percent"] == 71.0
+        assert worker["temperature_c"] == 67.5
+        assert worker["metrics_updated_at"] is not None
+
+
+def test_scheduler_ranks_device_with_more_headroom_higher():
+    with TestClient(app) as client:
+        assert register(
+            client, name="Strong device", available_ram_mb=3000,
+            cpu_percent=10, temperature_c=42, battery_percent=90,
+            battery_plugged=False,
+        ).status_code == 200
+        assert register(
+            client, name="Busy device", available_ram_mb=512,
+            cpu_percent=90, temperature_c=70, battery_percent=15,
+            battery_plugged=False,
+        ).status_code == 200
+        by_name = {worker.name: worker for worker in workers.values()}
+        assert _worker_score(by_name["Strong device"]) > _worker_score(by_name["Busy device"])
+        preview = client.get("/api/scheduler/preview").json()
+        assert preview["eligible"][0]["name"] == "Strong device"
+
+
+def test_scheduler_excludes_hot_and_critically_low_battery_devices():
+    with TestClient(app) as client:
+        assert register(
+            client, name="Hot device", temperature_c=85.0,
+        ).status_code == 200
+        assert register(
+            client, name="Low battery", battery_percent=5.0,
+            battery_plugged=False,
+        ).status_code == 200
+        by_name = {worker.name: worker for worker in workers.values()}
+        assert not _worker_is_eligible(by_name["Hot device"])
+        assert not _worker_is_eligible(by_name["Low battery"])
+        preview = client.get("/api/scheduler/preview").json()
+        excluded = {item["name"]: item["reason"] for item in preview["excluded"]}
+        assert "temperature safety limit" in excluded["Hot device"]
+        assert "critical battery" in excluded["Low battery"]
+
+
+def test_legacy_empty_heartbeat_remains_accepted():
+    with TestClient(app) as client:
+        worker_id = register(client).json()["worker_id"]
+        response = client.post(f"/api/workers/{worker_id}/heartbeat")
+        assert response.status_code == 200
