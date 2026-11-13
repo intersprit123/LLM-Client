@@ -277,7 +277,9 @@ async def main() -> None:
             "worker_secret": session["worker_secret"],
         })
         response.raise_for_status()
-        worker_id = response.json()["worker_id"]
+        registration = response.json()
+        worker_id = registration["worker_id"]
+        worker_headers = {"X-Worker-Token": registration["worker_token"]}
         print(f"Joined. Worker ID: {worker_id}. Press Ctrl+C to leave.")
         try:
             while True:
@@ -285,22 +287,25 @@ async def main() -> None:
                 started = time.perf_counter()
                 await client.post(
                     base + f"/api/workers/{worker_id}/heartbeat",
-                    json=heartbeat_metrics,
+                    json=heartbeat_metrics, headers=worker_headers,
                 )
                 heartbeat_metrics["network_rtt_ms"] = round(
                     (time.perf_counter() - started) * 1000, 2
                 )
-                # Include measured round-trip time in the next heartbeat.
                 await client.post(
                     base + f"/api/workers/{worker_id}/heartbeat",
                     json={"network_rtt_ms": heartbeat_metrics["network_rtt_ms"]},
+                    headers=worker_headers,
                 )
                 await asyncio.sleep(10)
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
             try:
-                await client.post(base + f"/api/workers/{worker_id}/leave")
+                await client.post(
+                    base + f"/api/workers/{worker_id}/leave",
+                    headers=worker_headers,
+                )
             except httpx.HTTPError:
                 pass
             print("Worker left the pool.")
