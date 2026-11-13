@@ -1,23 +1,19 @@
 # MeshLLM
 
-MeshLLM is an opt-in, local-network compute pool for running AI workloads across computers and mobile devices.
+MeshLLM is an opt-in, local-network compute pool for running AI workloads across computers, tablets and phones.
 
-> **Consent and safety:** Every worker must be explicitly paired, approved, and started by its owner. Workers advertise capabilities, accept bounded jobs, and can pause or disconnect at any time. No stealth installation, persistence, forced resource use, or remote shell is supported.
+> **Consent:** every worker is explicitly paired and started by its owner. Workers can leave at any time. MeshLLM does not provide stealth installation, remote shell, or forced resource use.
 
-## MVP architecture
+## Two compute modes
 
-- **Coordinator (FastAPI):** owns the pool, worker registry, health/status reporting, and job lifecycle.
-- **Worker agent:** explicitly connects to a coordinator, reports CPU/RAM/runtime capabilities, and exposes a bounded execution interface.
-- **Web UI:** a lightweight dashboard for worker enrollment, pool status, and job submission.
-- **Inference runtime:** model execution is initially delegated to a local Ollama endpoint. This keeps model compatibility and hardware acceleration inside a supported runtime while the project proves cross-device orchestration.
+1. **Parallel requests (heterogeneous):** the coordinator balances independent inference requests across opted-in Ollama workers. This increases throughput, not the size of one model.
+2. **Model sharding (llama.cpp RPC):** supported llama.cpp builds can expose CPU/GPU backends from remote devices. A coordinator-side `llama-server` uses `--rpc host:port,...` to distribute model weights and KV cache over those devices. The main host must have a compatible llama.cpp build and access to the model file.
 
-## Important limitation
-
-A model cannot generally be split across arbitrary CPUs/GPUs and devices merely by adding their advertised FLOPS. Efficient tensor/model parallelism requires compatible runtimes, communication collectives, memory placement, and often matching accelerator backends. This MVP coordinates workers and routes independent inference requests; it does **not** yet combine separate GPUs into one unified VRAM device or shard a single model across heterogeneous phones and PCs.
+llama.cpp RPC is explicitly documented upstream as proof-of-concept, fragile and insecure. Do not expose it to the internet or an untrusted LAN. Keep it on a trusted isolated network. The worker agent does not start or expose RPC automatically; the owner configures and starts the RPC server separately.
 
 ## Quick start
 
-Requirements: Python 3.11+
+Python 3.11+:
 
 ```bash
 python -m venv .venv
@@ -27,31 +23,43 @@ pip install -r requirements.txt
 uvicorn meshllm.server:app --host 0.0.0.0 --port 8765
 ```
 
-Open `http://127.0.0.1:8765`. Keep the coordinator on a trusted LAN. The API has a pairing token; do not expose it to the public internet.
-
-Start a worker on another device:
+Open `http://127.0.0.1:8765`, generate a one-time pairing token, and start each worker manually:
 
 ```bash
-python -m meshllm.worker --server http://COORDINATOR_LAN_IP:8765 --name "Bedroom-PC"
+python -m meshllm.worker --server http://COORDINATOR_IP:8765 --name "Laptop" --ollama-url http://127.0.0.1:11434 --max-parallel-jobs 2
 ```
 
-The worker prompts for a one-time pairing token, then asks for explicit local consent before joining. To execute inference, install Ollama on the worker and pull a model, then start the worker with `--ollama-url http://127.0.0.1:11434`.
+For a worker that also runs a separately configured llama.cpp RPC server:
+
+```bash
+python -m meshllm.worker --server http://COORDINATOR_IP:8765 --name "GPU-PC" --ollama-url http://127.0.0.1:11434 --rpc-endpoint 192.168.1.22:50052
+```
+
+On each remote RPC host, build llama.cpp with `-DGGML_RPC=ON` and the desired backend (CUDA, Metal, Vulkan, or CPU as supported by that build), then start `ggml-rpc-server` bound only to the trusted LAN interface. Check the upstream llama.cpp RPC documentation for the exact build and runtime options.
+
+In the dashboard's model-sharding panel, enter a GGUF model path on the coordinator and generate a launch command. Review it before running. The generated command includes every online worker that registered an RPC endpoint:
+
+```bash
+llama-server -m /models/model.gguf --host 127.0.0.1 --port 8080 -np 2 --rpc 192.168.1.22:50052,192.168.1.23:50052
+```
+
+llama.cpp distributes model weights and KV cache across available devices by memory capacity by default; optional tensor split proportions can be supplied to the planning API.
 
 ## API
 
-- `GET /` dashboard
 - `GET /api/health`
-- `POST /api/pairing-token` creates a short-lived token
-- `POST /api/workers/register` enrolls an opted-in worker
+- `POST /api/pairing-token`
+- `POST /api/workers/register`
 - `POST /api/workers/{worker_id}/heartbeat`
 - `POST /api/workers/{worker_id}/leave`
 - `GET /api/workers`
-- `POST /api/jobs` submits a prompt/model request
-- `GET /api/jobs/{job_id}`
+- `POST /api/jobs` and `GET /api/jobs/{job_id}`
+- `POST /api/distributed/plan` — creates a reviewed llama.cpp launch plan; it never launches a process.
 
-## Roadmap
+## Platform reality
 
-1. LAN pairing, explicit worker consent, heartbeats, and dashboard.
-2. Work-stealing request scheduler with model-aware routing and bounded concurrency.
-3. Cross-platform worker packaging (Windows, Linux, Android/Termux).
-4. Optional distributed inference backend (e.g. llama.cpp RPC / compatible tensor-parallel engine), validated per backend and hardware combination.
+The coordinator and Python worker can run on Windows, Linux and Android/Termux where Python and the dependencies are available. Actual GPU acceleration depends on the separately built inference runtime and drivers. A phone may contribute CPU/RAM to compatible backends, but it is not automatically a CUDA/Metal device. Heterogeneous pooling is best-effort and network bandwidth/latency can make a cluster slower than one machine.
+
+## Development
+
+Run tests with `pip install -r requirements-dev.txt && pytest`.
