@@ -288,3 +288,27 @@ def test_worker_endpoints_require_private_token_and_listing_does_not_leak_it():
             f"/api/workers/{worker_id}/leave",
             headers={"X-Worker-Token": token},
         ).status_code == 200
+
+
+
+def test_hybrid_plan_combines_sharding_and_parallel_worker_pool():
+    with TestClient(app) as client:
+        register(client, name="RPC node", rpc_endpoint="192.168.1.22:50052")
+        register(client, name="Ollama node", ollama_url="http://127.0.0.1:11434")
+        response = client.post("/api/hybrid/plan", json={"model_path": "model.gguf"})
+        assert response.status_code == 200
+        plan = response.json()
+        assert plan["mode"] == "hybrid"
+        assert plan["model_sharding"]["tensor_split_source"] == "automatic_memory_estimate"
+        assert [w["name"] for w in plan["parallel_inference_workers"]] == ["Ollama node"]
+        assert plan["orchestration"]["execution"] == "plan_only"
+
+
+def test_gpu_benchmark_score_is_stored_and_used_by_scheduler():
+    with TestClient(app) as client:
+        registration = register(
+            client, gpu_benchmark_score=85000.0,
+        )
+        assert registration.status_code == 200
+        worker = client.get("/api/workers").json()[0]
+        assert worker["gpu_benchmark_score"] == 85000.0
