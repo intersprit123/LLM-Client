@@ -45,7 +45,7 @@ In the dashboard's model-sharding panel, enter a GGUF model path on the coordina
 llama-server -m /models/model.gguf --host 127.0.0.1 --port 8080 -np 2 --rpc 192.168.1.22:50052,192.168.1.23:50052
 ```
 
-llama.cpp distributes model weights and KV cache across available devices by memory capacity by default; optional tensor split proportions can be supplied to the planning API.
+MeshLLM now generates an automatic tensor-split estimate when no manual split is supplied. It uses the coordinator's configurable `local_memory_mb` (default 4096 MB) plus each RPC worker's reported free VRAM, falling back to available RAM and then half of total RAM. The estimate is a planning aid, not a guarantee that a model will fit: backend device ordering, runtime reservations, KV cache and model architecture still matter. You can override it with explicit `tensor_split` proportions. The dashboard/API returns the memory assumptions alongside the command.
 
 ## API
 
