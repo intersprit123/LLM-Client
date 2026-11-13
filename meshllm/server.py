@@ -1,12 +1,9 @@
-"""MeshLLM coordinator API.
-
-The coordinator never executes arbitrary code on workers. It schedules bounded
-inference requests to workers that explicitly joined the pool.
-"""
+"""MeshLLM coordinator: opt-in worker pool and llama.cpp RPC planner."""
 from __future__ import annotations
 
 import asyncio
 import secrets
+import shlex
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -34,9 +31,11 @@ class Worker:
     gpu_name: str | None
     runtimes: list[str]
     ollama_url: str | None
+    rpc_endpoint: str | None
+    max_parallel_jobs: int
+    active_jobs: int
     joined_at: float
     last_seen: float
-    busy: bool = False
     enabled: bool = True
 
 
@@ -60,17 +59,23 @@ class PairRequest(BaseModel):
     gpu_name: str | None = Field(default=None, max_length=128)
     runtimes: list[str] = Field(default_factory=list, max_length=16)
     ollama_url: str | None = Field(default=None, max_length=256)
+    rpc_endpoint: str | None = Field(default=None, pattern=r"^[A-Za-z0-9.-]+:[0-9]{1,5}$")
+    max_parallel_jobs: int = Field(default=1, ge=1, le=16)
     pairing_token: str = Field(min_length=16, max_length=128)
-
-
-class HeartbeatRequest(BaseModel):
-    busy: bool = False
 
 
 class JobRequest(BaseModel):
     model: str = Field(min_length=1, max_length=128)
     prompt: str = Field(min_length=1, max_length=MAX_PROMPT_CHARS)
     max_tokens: int = Field(default=512, ge=1, le=MAX_OUTPUT_TOKENS)
+
+
+class DistributedPlanRequest(BaseModel):
+    model_path: str = Field(min_length=1, max_length=512)
+    host: str = Field(default="127.0.0.1", pattern=r"^[A-Za-z0-9.:-]+$")
+    port: int = Field(default=8080, ge=1024, le=65535)
+    parallel_slots: int = Field(default=2, ge=1, le=32)
+    tensor_split: str | None = Field(default=None, max_length=256)
 
 
 workers: dict[str, Worker] = {}
@@ -90,17 +95,18 @@ async def _mark_stale() -> None:
 async def _run_job(job: Job, max_tokens: int) -> None:
     selected: Worker | None = None
     async with lock:
-        candidates = [w for w in workers.values() if w.enabled and not w.busy and w.ollama_url]
-        candidates.sort(key=lambda w: (-w.ram_mb, w.name.lower()))
+        candidates = [w for w in workers.values()
+                      if w.enabled and w.ollama_url and w.active_jobs < w.max_parallel_jobs]
+        candidates.sort(key=lambda w: (w.active_jobs / w.max_parallel_jobs, -w.ram_mb))
         if candidates:
             selected = candidates[0]
-            selected.busy = True
+            selected.active_jobs += 1
             job.worker_id = selected.worker_id
             job.status = "running"
 
     if selected is None:
         job.status = "failed"
-        job.error = "No opted-in worker with an Ollama endpoint is currently available."
+        job.error = "No available opted-in Ollama worker. Check worker status and concurrency limits."
         return
 
     try:
@@ -118,7 +124,7 @@ async def _run_job(job: Job, max_tokens: int) -> None:
         job.error = f"Inference request failed: {type(exc).__name__}: {exc}"
     finally:
         async with lock:
-            selected.busy = False
+            selected.active_jobs = max(0, selected.active_jobs - 1)
 
 
 @asynccontextmanager
@@ -126,7 +132,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="MeshLLM Coordinator", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="MeshLLM Coordinator", version="0.2.0", lifespan=lifespan)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -154,24 +160,30 @@ async def register_worker(req: PairRequest) -> dict[str, Any]:
     expiry = pair_tokens.pop(req.pairing_token, None)
     if expiry is None or expiry < time.time():
         raise HTTPException(status_code=401, detail="Invalid or expired pairing token")
+    if req.rpc_endpoint and not (1 <= int(req.rpc_endpoint.rsplit(":", 1)[1]) <= 65535):
+        raise HTTPException(status_code=422, detail="RPC port must be between 1 and 65535")
     worker_id = str(uuid.uuid4())
     now = time.time()
-    worker = Worker(worker_id, req.name, req.platform, req.cpu_threads, req.ram_mb,
-                    req.gpu_name, req.runtimes, req.ollama_url, now, now)
+    worker = Worker(
+        worker_id=worker_id, name=req.name, platform=req.platform,
+        cpu_threads=req.cpu_threads, ram_mb=req.ram_mb, gpu_name=req.gpu_name,
+        runtimes=req.runtimes, ollama_url=req.ollama_url, rpc_endpoint=req.rpc_endpoint,
+        max_parallel_jobs=req.max_parallel_jobs, active_jobs=0,
+        joined_at=now, last_seen=now,
+    )
     async with lock:
         workers[worker_id] = worker
     return {"worker_id": worker_id, "heartbeat_interval_seconds": 10}
 
 
 @app.post("/api/workers/{worker_id}/heartbeat")
-async def heartbeat(worker_id: str, req: HeartbeatRequest) -> dict[str, bool]:
+async def heartbeat(worker_id: str) -> dict[str, bool]:
     async with lock:
         worker = workers.get(worker_id)
         if worker is None:
             raise HTTPException(status_code=404, detail="Unknown worker")
         worker.last_seen = time.time()
         worker.enabled = True
-        worker.busy = req.busy
     return {"ok": True}
 
 
@@ -211,33 +223,67 @@ async def get_job(job_id: str) -> dict[str, Any]:
         return asdict(job)
 
 
+@app.post("/api/distributed/plan")
+async def distributed_plan(req: DistributedPlanRequest) -> dict[str, Any]:
+    """Build a llama.cpp launch plan; never starts a process or opens RPC ports."""
+    await _mark_stale()
+    async with lock:
+        endpoints = sorted({w.rpc_endpoint for w in workers.values()
+                            if w.enabled and w.rpc_endpoint})
+    if not endpoints:
+        raise HTTPException(status_code=409, detail="No online worker has advertised a llama.cpp RPC endpoint")
+    args = ["llama-server", "-m", req.model_path, "--host", req.host,
+            "--port", str(req.port), "-np", str(req.parallel_slots),
+            "--rpc", ",".join(endpoints)]
+    if req.tensor_split:
+        # Numeric comma-separated proportions only; avoid shell injection.
+        parts = req.tensor_split.split(",")
+        try:
+            values = [float(part) for part in parts]
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="tensor_split must be comma-separated numbers") from exc
+        if len(values) != len(endpoints) + 1 or any(v <= 0 for v in values):
+            raise HTTPException(status_code=422, detail="tensor_split needs one positive value per RPC worker plus the local host")
+        args.extend(["--tensor-split", req.tensor_split])
+    return {
+        "backend": "llama.cpp RPC",
+        "rpc_endpoints": endpoints,
+        "command": shlex.join(args),
+        "argv": args,
+        "parallel_slots": req.parallel_slots,
+        "note": "Review the command before running. llama.cpp RPC is proof-of-concept and insecure; use only on a trusted isolated LAN. The model file must be accessible on the coordinator.",
+    }
+
+
 DASHBOARD = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MeshLLM</title><style>
 :root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#0b1020;color:#e8edff}
 body{max-width:1050px;margin:40px auto;padding:0 20px}h1{font-size:2.2rem;margin-bottom:4px}
 p{color:#9ca9c9}.card{background:#151d33;border:1px solid #293653;border-radius:16px;padding:20px;margin:16px 0}
-.row{display:flex;gap:12px;flex-wrap:wrap}.stat{min-width:130px;flex:1}
-.big{font-size:2rem;font-weight:700}button{background:#6d83ff;color:white;border:0;padding:11px 16px;border-radius:9px;cursor:pointer}
+.row{display:flex;gap:12px;flex-wrap:wrap}.stat{min-width:130px;flex:1}.big{font-size:2rem;font-weight:700}
+button{background:#6d83ff;color:white;border:0;padding:11px 16px;border-radius:9px;cursor:pointer}
 input,textarea{background:#0e1528;color:#e8edff;border:1px solid #344365;border-radius:8px;padding:10px;width:100%;box-sizing:border-box;margin:6px 0 12px}
-textarea{min-height:110px}code{color:#aab8ff}.muted{font-size:.9rem;color:#9ca9c9}
-table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px;border-bottom:1px solid #293653}
+textarea{min-height:110px}.muted{font-size:.9rem;color:#9ca9c9}table{width:100%;border-collapse:collapse}
+td,th{text-align:left;padding:9px;border-bottom:1px solid #293653}
 </style></head><body>
-<h1>MeshLLM <span class="muted">0.1</span></h1><p>Opt-in AI compute pool · trusted local network</p>
+<h1>MeshLLM <span class="muted">0.2</span></h1><p>Opt-in heterogeneous AI compute pool · trusted local network</p>
 <div class="card row"><div class="stat"><div class="big" id="online">0</div><div class="muted">Online workers</div></div>
-<div class="stat"><div class="big" id="total">0</div><div class="muted">Registered workers</div></div>
-<div class="stat"><div class="big" id="jobs">0</div><div class="muted">Jobs tracked</div></div></div>
+<div class="stat"><div class="big" id="total">0</div><div class="muted">Registered workers</div></div><div class="stat"><div class="big" id="jobs">0</div><div class="muted">Jobs tracked</div></div></div>
 <div class="card"><h2>Pair a device</h2><p>Create a short-lived token, then enter it into a worker started by its owner.</p>
-<button onclick="token()">Generate pairing token</button><p id="token" class="big"></p><p class="muted">Treat this token like a password. It expires in five minutes and can be used once.</p></div>
-<div class="card"><h2>Workers</h2><table><thead><tr><th>Name</th><th>Platform</th><th>CPU threads</th><th>RAM</th><th>GPU</th><th>Status</th></tr></thead><tbody id="workers"></tbody></table></div>
-<div class="card"><h2>Submit inference</h2><label>Model (must be installed in worker Ollama)</label><input id="model" value="llama3.2"><label>Prompt</label><textarea id="prompt" placeholder="Ask the model something..."></textarea><button onclick="submitJob()">Run inference</button><pre id="result"></pre></div>
+<button onclick="token()">Generate pairing token</button><p id="token" class="big"></p><p class="muted">One use, expires in five minutes.</p></div>
+<div class="card"><h2>Workers</h2><table><thead><tr><th>Name</th><th>Platform</th><th>CPU</th><th>RAM</th><th>GPU</th><th>RPC</th><th>Load</th></tr></thead><tbody id="workers"></tbody></table></div>
+<div class="card"><h2>Submit parallel inference</h2><label>Ollama model</label><input id="model" value="llama3.2"><label>Prompt</label><textarea id="prompt" placeholder="Ask the model something..."></textarea><button onclick="submitJob()">Run inference</button><pre id="result"></pre></div>
+<div class="card"><h2>Model-sharding launch plan</h2><p>Generate a llama.cpp RPC command using all paired workers that advertise an RPC endpoint. This does not launch it.</p>
+<label>GGUF model path on coordinator</label><input id="gguf" placeholder="/models/model.gguf"><label>Parallel request slots</label><input id="slots" type="number" min="1" max="32" value="2"><button onclick="plan()">Generate distributed command</button><pre id="plan"></pre></div>
 <script>
 async function refresh(){try{let [h,w]=await Promise.all([fetch('/api/health').then(r=>r.json()),fetch('/api/workers').then(r=>r.json())]);
 document.getElementById('online').textContent=h.online_workers;document.getElementById('total').textContent=h.workers;document.getElementById('jobs').textContent=h.jobs;
-document.getElementById('workers').innerHTML=w.map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.platform)+'</td><td>'+x.cpu_threads+'</td><td>'+Math.round(x.ram_mb/1024)+' GB</td><td>'+esc(x.gpu_name||'—')+'</td><td>'+(x.online?'Online':'Offline')+'</td></tr>').join('')||'<tr><td colspan="6">No workers paired yet.</td></tr>';
+document.getElementById('workers').innerHTML=w.map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.platform)+'</td><td>'+x.cpu_threads+'</td><td>'+Math.round(x.ram_mb/1024)+' GB</td><td>'+esc(x.gpu_name||'—')+'</td><td>'+esc(x.rpc_endpoint||'—')+'</td><td>'+x.active_jobs+'/'+x.max_parallel_jobs+'</td></tr>').join('')||'<tr><td colspan="7">No workers paired yet.</td></tr>';
 }catch(e){}}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 async function token(){let r=await fetch('/api/pairing-token',{method:'POST'});let x=await r.json();document.getElementById('token').textContent=x.pairing_token;}
 async function submitJob(){let out=document.getElementById('result');out.textContent='Submitting...';let r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:document.getElementById('model').value,prompt:document.getElementById('prompt').value})});let x=await r.json();if(!r.ok){out.textContent=JSON.stringify(x);return;}out.textContent='Job '+x.job_id+' queued...';let timer=setInterval(async()=>{let j=await fetch('/api/jobs/'+x.job_id).then(r=>r.json());if(j.status==='completed'||j.status==='failed'){clearInterval(timer);out.textContent=j.status==='completed'?j.response:(j.error||'Failed');}},1000);}
+async function plan(){let out=document.getElementById('plan');out.textContent='Building plan...';let r=await fetch('/api/distributed/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model_path:document.getElementById('gguf').value,parallel_slots:Number(document.getElementById('slots').value)})});let x=await r.json();out.textContent=r.ok?x.command+'\n\n'+x.note:JSON.stringify(x);}
 refresh();setInterval(refresh,4000);
 </script></body></html>"""
