@@ -102,6 +102,10 @@ class PairRequest(BaseModel):
     worker_secret: str = Field(min_length=32, max_length=128)
 
 
+class PairApprovalRequest(BaseModel):
+    worker_secret: str = Field(min_length=32, max_length=128)
+
+
 class PairSessionRequest(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     platform: str = Field(min_length=1, max_length=40)
@@ -360,34 +364,42 @@ def _pair_session(session_id: str, worker_secret: str) -> dict[str, Any]:
 
 
 @app.get("/api/pairing-sessions/{session_id}/status")
-async def pairing_status(session_id: str, worker_secret: str) -> dict[str, Any]:
-    session = _pair_session(session_id, worker_secret)
+async def pairing_status(
+    session_id: str, x_pairing_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    session = _pair_session(session_id, x_pairing_secret or "")
     return {"status": "approved" if session["approved"] else "waiting"}
 
 
 @app.post("/api/pairing-sessions/{session_id}/approve")
-async def approve_pairing(session_id: str, worker_secret: str) -> dict[str, bool]:
-    session = _pair_session(session_id, worker_secret)
+async def approve_pairing(
+    session_id: str, req: PairApprovalRequest,
+) -> dict[str, bool]:
+    session = _pair_session(session_id, req.worker_secret)
     session["approved"] = True
     session["approved_at"] = time.time()
     return {"approved": True}
 
 
 @app.get("/pair/approve/{session_id}", response_class=HTMLResponse)
-async def pairing_approval_page(session_id: str, worker_secret: str) -> str:
-    session = _pair_session(session_id, worker_secret)
+async def pairing_approval_page(session_id: str) -> str:
+    session = pair_sessions.get(session_id)
+    if session is None or session["expires_at"] < time.time():
+        raise HTTPException(status_code=410, detail="Pairing request expired")
     metadata = session["metadata"]
     safe_name = (metadata["name"].replace("&", "&amp;").replace("<", "&lt;")
                  .replace(">", "&gt;").replace('"', "&quot;"))
+    safe_platform = (metadata["platform"].replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;").replace('"', "&quot;"))
     return f"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Approve MeshLLM device</title><style>body{{font:16px system-ui;background:#0b1020;color:#eef;padding:28px;max-width:520px;margin:auto}}
     main{{background:#151d33;padding:24px;border-radius:16px}}button{{padding:14px 20px;background:#6d83ff;color:white;border:0;border-radius:10px;font-size:16px}}</style></head>
     <body><main><h1>Approve device?</h1><p><b>{safe_name}</b> wants to join your MeshLLM cluster.</p>
-    <p>Platform: {metadata["platform"]}</p><p>CPU threads: {metadata["cpu_threads"]} · RAM: {metadata["ram_mb"]} MB</p>
+    <p>Platform: {safe_platform}</p><p>CPU threads: {metadata["cpu_threads"]} · RAM: {metadata["ram_mb"]} MB</p>
     <p>This QR approval expires in five minutes. Only approve a device you control.</p>
     <button id="approve" onclick="approve()">Approve this device</button><p id="result"></p></main>
     <script>async function approve(){{let b=document.getElementById('approve');b.disabled=true;
-    let r=await fetch('/api/pairing-sessions/{session_id}/approve?worker_secret={worker_secret}',{{method:'POST'}});
+    let secret=location.hash.slice(1);let r=await fetch('/api/pairing-sessions/{session_id}/approve',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{worker_secret:secret}})}});
     document.getElementById('result').textContent=r.ok?'Approved. The worker can now join.':'Approval failed or expired.';}}</script></body></html>"""
 
 
