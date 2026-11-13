@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 PAIR_TTL_SECONDS = 300
@@ -55,6 +55,7 @@ class Worker:
     cpu_benchmark_score: float | None
     gpu_benchmark_score: float | None
     network_rtt_ms: float | None
+    network_mbps: float | None
     metrics_updated_at: float | None
     joined_at: float
     last_seen: float
@@ -96,6 +97,7 @@ class PairRequest(BaseModel):
     cpu_benchmark_score: float | None = Field(default=None, ge=0, le=10_000_000)
     gpu_benchmark_score: float | None = Field(default=None, ge=0, le=10_000_000)
     network_rtt_ms: float | None = Field(default=None, ge=0, le=60_000)
+    network_mbps: float | None = Field(default=None, ge=0, le=100_000)
     pairing_session_id: str = Field(min_length=16, max_length=128)
     worker_secret: str = Field(min_length=32, max_length=128)
 
@@ -210,6 +212,10 @@ def _worker_score(worker: Worker) -> float:
         0.035 * min(1.0, worker.gpu_benchmark_score / 100_000.0)
         if worker.gpu_benchmark_score is not None else 0.0
     )
+    bandwidth_bonus = (
+        0.025 * min(1.0, worker.network_mbps / 100.0)
+        if worker.network_mbps is not None else 0.0
+    )
     base = (
         0.32 * memory_headroom
         + 0.22 * cpu_headroom
@@ -217,7 +223,7 @@ def _worker_score(worker: Worker) -> float:
         + 0.08 * battery_headroom
         + 0.12 * network_headroom
     )
-    return round(min(1.0, base * thermal_headroom + gpu_bonus + benchmark_bonus + gpu_benchmark_bonus), 4)
+    return round(min(1.0, base * thermal_headroom + gpu_bonus + benchmark_bonus + gpu_benchmark_bonus + bandwidth_bonus), 4)
 
 
 def _worker_exclusion_reason(worker: Worker) -> str | None:
@@ -295,6 +301,16 @@ app = FastAPI(title="MeshLLM Coordinator", version=APP_VERSION, lifespan=lifespa
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> str:
     return DASHBOARD
+
+
+@app.get("/api/network/probe")
+async def network_probe() -> Response:
+    """Small no-cache payload used by workers for a one-time bandwidth estimate."""
+    return Response(
+        content=b"m" * 131072,
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "no-store", "X-MeshLLM-Probe": "1"},
+    )
 
 
 @app.get("/api/health")
@@ -395,12 +411,12 @@ async def register_worker(req: PairRequest) -> dict[str, Any]:
         gpu_util_percent=req.gpu_util_percent, battery_percent=req.battery_percent,
         battery_plugged=req.battery_plugged, temperature_c=req.temperature_c,
         cpu_benchmark_score=req.cpu_benchmark_score, gpu_benchmark_score=req.gpu_benchmark_score,
-        network_rtt_ms=req.network_rtt_ms,
+        network_rtt_ms=req.network_rtt_ms, network_mbps=req.network_mbps,
         metrics_updated_at=now if any(value is not None for value in (
             req.available_ram_mb, req.cpu_percent, req.gpu_mem_total_mb,
             req.gpu_mem_free_mb, req.gpu_util_percent, req.battery_percent,
             req.battery_plugged, req.temperature_c, req.cpu_benchmark_score,
-            req.network_rtt_ms, req.gpu_benchmark_score
+            req.network_rtt_ms, req.network_mbps, req.gpu_benchmark_score
         )) else None,
         joined_at=now, last_seen=now,
     )
