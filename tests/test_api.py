@@ -14,7 +14,7 @@ def reset_state():
     yield
     workers.clear()
     jobs.clear()
-    pair_tokens.clear()
+    pair_sessions.clear()
 
 
 def register(client, **overrides):
