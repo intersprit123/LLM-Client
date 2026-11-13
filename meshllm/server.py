@@ -154,17 +154,23 @@ def _worker_score(worker: Worker) -> float:
     return round(min(1.0, base * thermal_headroom + gpu_bonus), 4)
 
 
-def _worker_is_eligible(worker: Worker) -> bool:
-    if not worker.enabled or not worker.ollama_url:
-        return False
+def _worker_exclusion_reason(worker: Worker) -> str | None:
+    if not worker.enabled:
+        return "offline or heartbeat timed out"
+    if not worker.ollama_url:
+        return "Ollama runtime not configured"
     if worker.active_jobs >= worker.max_parallel_jobs:
-        return False
+        return "at configured job capacity"
     if worker.temperature_c is not None and worker.temperature_c >= 85.0:
-        return False
+        return "temperature safety limit reached"
     if (worker.battery_percent is not None and worker.battery_percent <= 5.0
             and not worker.battery_plugged):
-        return False
-    return True
+        return "critical battery while unplugged"
+    return None
+
+
+def _worker_is_eligible(worker: Worker) -> bool:
+    return _worker_exclusion_reason(worker) is None
 
 
 async def _run_job(job: Job, max_tokens: int) -> None:
@@ -174,9 +180,9 @@ async def _run_job(job: Job, max_tokens: int) -> None:
         candidates.sort(key=lambda w: (-_worker_score(w), w.name.lower()))
         if candidates:
             selected = candidates[0]
+            job.scheduler_score = _worker_score(selected)
             selected.active_jobs += 1
             job.worker_id = selected.worker_id
-            job.scheduler_score = _worker_score(selected)
             job.scheduler_decision = (
                 "Selected highest health-aware capacity score; "
                 "thermal and critical-battery limits were applied."
@@ -304,6 +310,31 @@ async def list_workers() -> list[dict[str, Any]]:
                 if w.metrics_updated_at is not None else None
             ),
         } for w in workers.values()]
+
+
+@app.get("/api/scheduler/preview")
+async def scheduler_preview() -> dict[str, Any]:
+    """Explain which Ollama workers are eligible and how the policy ranks them."""
+    await _mark_stale()
+    async with lock:
+        ranked = sorted(
+            workers.values(),
+            key=lambda w: (-_worker_score(w), w.name.lower()),
+        )
+        return {
+            "policy": "automatic capacity scoring with thermal and critical-battery guards",
+            "eligible": [
+                {"worker_id": w.worker_id, "name": w.name,
+                 "score": _worker_score(w), "active_jobs": w.active_jobs,
+                 "max_parallel_jobs": w.max_parallel_jobs}
+                for w in ranked if _worker_is_eligible(w)
+            ],
+            "excluded": [
+                {"worker_id": w.worker_id, "name": w.name,
+                 "reason": _worker_exclusion_reason(w)}
+                for w in ranked if not _worker_is_eligible(w)
+            ],
+        }
 
 
 @app.post("/api/jobs")
