@@ -52,9 +52,20 @@ llama.cpp distributes model weights and KV cache across available devices by mem
 - `POST /api/workers/register`
 - `POST /api/workers/{worker_id}/heartbeat`
 - `POST /api/workers/{worker_id}/leave`
-- `GET /api/workers`
+- `GET /api/workers` — includes latest telemetry, eligibility and scheduler score
+- `GET /api/scheduler/preview` — explains the automatic ranking and exclusion decisions
 - `POST /api/jobs` and `GET /api/jobs/{job_id}`
 - `POST /api/distributed/plan` — creates a reviewed llama.cpp launch plan; it never launches a process.
+
+## Automatic resource decisions
+
+After the owner approves pairing, a worker sends CPU load, available RAM, supported GPU memory/utilization, battery state and temperature at registration and on each 10-second heartbeat. Sensor availability depends on the operating system and drivers; unsupported values stay unknown. Installing optional `psutil` can improve CPU, battery and temperature reporting on platforms where it is supported:
+
+```bash
+python -m pip install psutil
+```
+
+The coordinator continuously ranks available Ollama workers using free-memory headroom, CPU headroom, free job slots and battery state. It does not ask the user to assign manual percentages. It excludes workers at or above 85°C and workers at 5% battery or lower when unplugged. These are conservative initial thresholds, not a substitute for device firmware thermal protection. The policy is a first milestone and will be tuned with real mixed-device benchmarks.
 
 ## Platform reality
 
