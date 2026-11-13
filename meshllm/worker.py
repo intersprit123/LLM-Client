@@ -203,12 +203,41 @@ def cpu_benchmark_score() -> float | None:
         return None
 
 
+def gpu_benchmark_score() -> float | None:
+    """Optional tiny PyTorch device probe; gracefully skips unsupported GPUs."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            synchronize = torch.cuda.synchronize
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+            synchronize = torch.mps.synchronize
+        else:
+            return None
+        left = torch.rand((256, 256), device=device)
+        right = torch.rand((256, 256), device=device)
+        for _ in range(2):
+            _ = left @ right
+        synchronize()
+        started = time.perf_counter()
+        for _ in range(4):
+            _ = left @ right
+        synchronize()
+        elapsed = max(time.perf_counter() - started, 0.000001)
+        mega_flops = (4 * 2 * 256 ** 3) / elapsed / 1_000_000
+        return round(float(mega_flops), 1)
+    except Exception:
+        return None
+
+
 def collect_telemetry() -> dict:
     telemetry = {
         "available_ram_mb": available_memory_mb(),
         "cpu_percent": cpu_percent(),
         "temperature_c": temperature_c(),
         "cpu_benchmark_score": cpu_benchmark_score(),
+        "gpu_benchmark_score": gpu_benchmark_score(),
     }
     telemetry.update(gpu_metrics())
     telemetry.update(battery_metrics())
@@ -284,6 +313,13 @@ async def main() -> None:
         try:
             while True:
                 heartbeat_metrics = collect_telemetry()
+                # Benchmarks run once at join time, not on every heartbeat.
+                heartbeat_metrics["cpu_benchmark_score"] = telemetry.get("cpu_benchmark_score")
+                heartbeat_metrics["gpu_benchmark_score"] = telemetry.get("gpu_benchmark_score")
+                heartbeat_metrics = {
+                    key: value for key, value in heartbeat_metrics.items()
+                    if value is not None
+                }
                 started = time.perf_counter()
                 await client.post(
                     base + f"/api/workers/{worker_id}/heartbeat",
