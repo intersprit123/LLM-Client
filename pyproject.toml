@@ -1,0 +1,8 @@
+[project]
+name = "meshllm"
+version = "0.1.0"
+description = "Opt-in local-network AI compute pool"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
