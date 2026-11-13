@@ -489,22 +489,24 @@ input,textarea{background:#0e1528;color:#e8edff;border:1px solid #344365;border-
 textarea{min-height:110px}.muted{font-size:.9rem;color:#9ca9c9}table{width:100%;border-collapse:collapse}
 td,th{text-align:left;padding:9px;border-bottom:1px solid #293653}
 </style></head><body>
-<h1>MeshLLM <span class="muted">0.2</span></h1><p>Opt-in heterogeneous AI compute pool · trusted local network</p>
+<h1>MeshLLM <span class="muted">0.3-dev</span></h1><p>Opt-in heterogeneous AI compute pool · trusted local network</p>
+<div class="card"><b>Build / instance timestamp:</b> <span id="buildtime">Loading…</span><br><b>Current server time:</b> <span id="servertime">Loading…</span></div>
 <div class="card row"><div class="stat"><div class="big" id="online">0</div><div class="muted">Online workers</div></div>
 <div class="stat"><div class="big" id="total">0</div><div class="muted">Registered workers</div></div><div class="stat"><div class="big" id="jobs">0</div><div class="muted">Jobs tracked</div></div></div>
-<div class="card"><h2>Pair a device</h2><p>Create a short-lived token, then enter it into a worker started by its owner.</p>
-<button onclick="token()">Generate pairing token</button><p id="token" class="big"></p><p class="muted">One use, expires in five minutes.</p></div>
+<div class="card"><h2>QR-only device approval</h2><p>Start the worker on the device you own. It displays a one-time QR code. Scan it with the cluster owner's phone and explicitly approve the device. Requests expire after five minutes.</p><p class="muted">No typed pairing tokens. Scanning alone does not grant access.</p></div>
 <div class="card"><h2>Workers · live telemetry</h2><p class="muted">The scheduler continuously ranks eligible workers. Scores are relative capacity indicators, not benchmarked tokens/second.</p><table><thead><tr><th>Name</th><th>Platform</th><th>Threads</th><th>Free / total RAM</th><th>CPU load</th><th>GPU</th><th>Temp / battery</th><th>Jobs</th><th>Auto score</th></tr></thead><tbody id="workers"></tbody></table></div>
 <div class="card"><h2>Submit parallel inference</h2><label>Ollama model</label><input id="model" value="llama3.2"><label>Prompt</label><textarea id="prompt" placeholder="Ask the model something..."></textarea><button onclick="submitJob()">Run inference</button><pre id="result"></pre></div>
 <div class="card"><h2>Model-sharding launch plan</h2><p>Generate a llama.cpp RPC command using all paired workers that advertise an RPC endpoint. This does not launch it.</p>
 <label>GGUF model path on coordinator</label><input id="gguf" placeholder="/models/model.gguf"><label>Parallel request slots</label><input id="slots" type="number" min="1" max="32" value="2"><button onclick="plan()">Generate distributed command</button><pre id="plan"></pre></div>
 <script>
+function fmtDate(value){return value?new Date(value).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'medium',timeZoneName:'short'}):'Unavailable';}
 async function refresh(){try{let [h,w]=await Promise.all([fetch('/api/health').then(r=>r.json()),fetch('/api/workers').then(r=>r.json())]);
+document.getElementById('buildtime').textContent=fmtDate(h.build_timestamp_utc)+' (timestamp stored in UTC; displayed locally)';
+document.getElementById('servertime').textContent=fmtDate(h.server_time_utc);
 document.getElementById('online').textContent=h.online_workers;document.getElementById('total').textContent=h.workers;document.getElementById('jobs').textContent=h.jobs;
 document.getElementById('workers').innerHTML=w.map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.platform)+'</td><td>'+x.cpu_threads+'</td><td>'+(x.available_ram_mb==null?'—':Math.round(x.available_ram_mb/1024)+' GB')+' / '+Math.round(x.ram_mb/1024)+' GB'</td><td>'+(x.cpu_percent==null?'—':Math.round(x.cpu_percent)+'%')+'</td><td>'+esc(x.gpu_name||'—')+(x.gpu_mem_free_mb==null?'':' ('+x.gpu_mem_free_mb+' MB free)')+'</td><td>'+(x.temperature_c==null?'—':x.temperature_c.toFixed(1)+'°C')+' / '+(x.battery_percent==null?'—':Math.round(x.battery_percent)+'%')+'</td><td>'+x.active_jobs+'/'+x.max_parallel_jobs+'</td><td>'+x.scheduler_score+' · '+(x.eligible_for_inference?'eligible':'held')+'</td></tr>').join('')||'<tr><td colspan="9">No workers paired yet.</td></tr>';
 }catch(e){}}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-async function token(){let r=await fetch('/api/pairing-token',{method:'POST'});let x=await r.json();document.getElementById('token').textContent=x.pairing_token;}
 async function submitJob(){let out=document.getElementById('result');out.textContent='Submitting...';let r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:document.getElementById('model').value,prompt:document.getElementById('prompt').value})});let x=await r.json();if(!r.ok){out.textContent=JSON.stringify(x);return;}out.textContent='Job '+x.job_id+' queued...';let timer=setInterval(async()=>{let j=await fetch('/api/jobs/'+x.job_id).then(r=>r.json());if(j.status==='completed'||j.status==='failed'){clearInterval(timer);out.textContent=j.status==='completed'?j.response:(j.error||'Failed');}},1000);}
 async function plan(){let out=document.getElementById('plan');out.textContent='Building plan...';let r=await fetch('/api/distributed/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model_path:document.getElementById('gguf').value,parallel_slots:Number(document.getElementById('slots').value)})});let x=await r.json();out.textContent=r.ok?x.command+'\n\n'+x.note:JSON.stringify(x);}
 refresh();setInterval(refresh,4000);
