@@ -499,7 +499,7 @@ td,th{text-align:left;padding:9px;border-bottom:1px solid #293653}
 <div class="card"><h2>Model-sharding launch plan</h2><p>Generate a llama.cpp RPC command using all paired workers that advertise an RPC endpoint. This does not launch it.</p>
 <label>GGUF model path on coordinator</label><input id="gguf" placeholder="/models/model.gguf"><label>Parallel request slots</label><input id="slots" type="number" min="1" max="32" value="2"><button onclick="plan()">Generate distributed command</button><pre id="plan"></pre></div>
 <script>
-function fmtDate(value){return value?new Date(value).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'medium',timeZoneName:'short'}):'Unavailable';}
+function fmtDate(value){return value?new Date(value).toLocaleString(undefined,{year:'numeric',month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZoneName:'short'}):'Unavailable';}
 async function refresh(){try{let [h,w]=await Promise.all([fetch('/api/health').then(r=>r.json()),fetch('/api/workers').then(r=>r.json())]);
 document.getElementById('buildtime').textContent=fmtDate(h.build_timestamp_utc)+' (timestamp stored in UTC; displayed locally)';
 document.getElementById('servertime').textContent=fmtDate(h.server_time_utc);
