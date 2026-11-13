@@ -1,8 +1,12 @@
+import asyncio
+
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from meshllm.server import (
-    app, jobs, pair_sessions, worker_auth_hashes, workers, _worker_is_eligible, _worker_score,
+    Job, app, jobs, pair_sessions, worker_auth_hashes, workers,
+    _run_job, _worker_is_eligible, _worker_score,
 )
 
 
@@ -333,3 +337,44 @@ def test_worker_network_bandwidth_metric_is_accepted():
         )
         assert response.status_code == 200
         assert client.get("/api/workers").json()[0]["network_mbps"] == 92.4
+
+
+def test_job_fails_over_to_next_worker_when_selected_worker_is_unreachable(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"response": "Recovered on backup worker"}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, **kwargs):
+            if "offline" in url:
+                raise httpx.ConnectError("worker offline")
+            return FakeResponse()
+
+    with TestClient(app) as client:
+        register(
+            client, name="Primary", ollama_url="http://offline:11434",
+            available_ram_mb=3500, cpu_percent=5,
+        )
+        register(
+            client, name="Backup", ollama_url="http://backup:11434",
+            available_ram_mb=1500, cpu_percent=40,
+        )
+        primary_id = next(w.worker_id for w in workers.values() if w.name == "Primary")
+        backup_id = next(w.worker_id for w in workers.values() if w.name == "Backup")
+        monkeypatch.setattr("meshllm.server.httpx.AsyncClient", lambda **kwargs: FakeClient())
+        job = Job("job-test", "test-model", "hello", "queued", 1.0)
+        asyncio.run(_run_job(job, 32))
+        assert job.status == "completed"
+        assert job.response == "Recovered on backup worker"
+        assert job.worker_id == backup_id
+        assert workers[primary_id].active_jobs == 0
+        assert workers[backup_id].active_jobs == 0
