@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import hashlib
 import math
 import os
 import secrets
@@ -15,7 +16,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -149,8 +150,20 @@ class DistributedPlanRequest(BaseModel):
 
 
 workers: dict[str, Worker] = {}
+worker_auth_hashes: dict[str, str] = {}
 jobs: dict[str, Job] = {}
 lock = asyncio.Lock()
+
+
+def _authenticate_worker(worker_id: str, token: str | None) -> Worker:
+    worker = workers.get(worker_id)
+    expected = worker_auth_hashes.get(worker_id)
+    if worker is None or expected is None or token is None:
+        raise HTTPException(status_code=401, detail="Worker authentication required")
+    supplied = hashlib.sha256(token.encode()).hexdigest()
+    if not hmac.compare_digest(expected, supplied):
+        raise HTTPException(status_code=403, detail="Invalid worker credential")
+    return worker
 
 
 async def _mark_stale() -> None:
@@ -363,6 +376,8 @@ async def register_worker(req: PairRequest) -> dict[str, Any]:
     if req.rpc_endpoint and not (1 <= int(req.rpc_endpoint.rsplit(":", 1)[1]) <= 65535):
         raise HTTPException(status_code=422, detail="RPC port must be between 1 and 65535")
     worker_id = str(uuid.uuid4())
+    worker_token = secrets.token_urlsafe(32)
+    worker_auth_hashes[worker_id] = hashlib.sha256(worker_token.encode()).hexdigest()
     now = time.time()
     worker = Worker(
         worker_id=worker_id, name=req.name, platform=req.platform,
@@ -384,15 +399,17 @@ async def register_worker(req: PairRequest) -> dict[str, Any]:
     )
     async with lock:
         workers[worker_id] = worker
-    return {"worker_id": worker_id, "heartbeat_interval_seconds": 10}
+    return {"worker_id": worker_id, "worker_token": worker_token,
+            "heartbeat_interval_seconds": 10}
 
 
 @app.post("/api/workers/{worker_id}/heartbeat")
-async def heartbeat(worker_id: str, metrics: HeartbeatMetrics | None = None) -> dict[str, bool]:
+async def heartbeat(
+    worker_id: str, metrics: HeartbeatMetrics | None = None,
+    x_worker_token: str | None = Header(default=None),
+) -> dict[str, bool]:
     async with lock:
-        worker = workers.get(worker_id)
-        if worker is None:
-            raise HTTPException(status_code=404, detail="Unknown worker")
+        worker = _authenticate_worker(worker_id, x_worker_token)
         worker.last_seen = time.time()
         worker.enabled = True
         if metrics is not None:
@@ -404,11 +421,13 @@ async def heartbeat(worker_id: str, metrics: HeartbeatMetrics | None = None) -> 
 
 
 @app.post("/api/workers/{worker_id}/leave")
-async def leave_worker(worker_id: str) -> dict[str, bool]:
+async def leave_worker(
+    worker_id: str, x_worker_token: str | None = Header(default=None),
+) -> dict[str, bool]:
     async with lock:
-        worker = workers.pop(worker_id, None)
-    if worker is None:
-        raise HTTPException(status_code=404, detail="Unknown worker")
+        _authenticate_worker(worker_id, x_worker_token)
+        workers.pop(worker_id, None)
+        worker_auth_hashes.pop(worker_id, None)
     return {"ok": True}
 
 
