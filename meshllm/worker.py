@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import glob
 import os
 import platform
 import subprocess
 import sys
+import time
 
 import httpx
 
@@ -49,6 +51,152 @@ def gpu_name() -> str | None:
         return None
 
 
+def available_memory_mb() -> int | None:
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_ulong), ("memoryLoad", ctypes.c_ulong),
+                            ("totalPhys", ctypes.c_ulonglong), ("availPhys", ctypes.c_ulonglong),
+                            ("totalPageFile", ctypes.c_ulonglong), ("availPageFile", ctypes.c_ulonglong),
+                            ("totalVirtual", ctypes.c_ulonglong), ("availVirtual", ctypes.c_ulonglong),
+                            ("availExtendedVirtual", ctypes.c_ulonglong)]
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.availPhys / (1024 * 1024))
+            return None
+        if sys.platform == "darwin":
+            output = subprocess.check_output(["vm_stat"], text=True, timeout=3)
+            page_size = int(output.split("page size of ")[1].split(" bytes")[0])
+            pages = 0
+            for line in output.splitlines():
+                if any(key in line for key in ("Pages free:", "Pages inactive:", "Pages speculative:")):
+                    pages += int(line.split(":")[1].strip().rstrip("."))
+            return pages * page_size // (1024 * 1024)
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            values = {}
+            for line in f:
+                key, value = line.split(":", 1)
+                if key in {"MemAvailable", "MemFree"}:
+                    values[key] = int(value.split()[0])
+            return values.get("MemAvailable", values.get("MemFree", 0)) // 1024
+    except Exception:
+        return None
+
+
+def cpu_percent() -> float | None:
+    try:
+        import psutil
+        return round(float(psutil.cpu_percent(interval=0.15)), 1)
+    except ImportError:
+        pass
+    except Exception:
+        return None
+
+    if hasattr(os, "getloadavg") and os.cpu_count():
+        try:
+            return round(min(100.0, max(0.0, os.getloadavg()[0] / os.cpu_count() * 100)), 1)
+        except OSError:
+            return None
+    if sys.platform.startswith("linux"):
+        try:
+            def read_times():
+                with open("/proc/stat", encoding="utf-8") as f:
+                    fields = [int(x) for x in f.readline().split()[1:]]
+                return sum(fields), fields[3] + (fields[4] if len(fields) > 4 else 0)
+            total_a, idle_a = read_times()
+            time.sleep(0.12)
+            total_b, idle_b = read_times()
+            total_delta, idle_delta = total_b - total_a, idle_b - idle_a
+            if total_delta > 0:
+                return round(100.0 * (1 - idle_delta / total_delta), 1)
+        except Exception:
+            return None
+    return None
+
+
+def gpu_metrics() -> dict:
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total,memory.free,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            text=True, stderr=subprocess.DEVNULL, timeout=4,
+        )
+        rows = [line.split(",") for line in output.splitlines() if line.strip()]
+        if not rows:
+            return {}
+        first = [value.strip() for value in rows[0]]
+        return {
+            "gpu_name": first[0][:128],
+            "gpu_mem_total_mb": max(0, int(float(first[1]))),
+            "gpu_mem_free_mb": max(0, int(float(first[2]))),
+            "gpu_util_percent": max(0.0, min(100.0, float(first[3]))),
+        }
+    except Exception:
+        return {}
+
+
+def battery_metrics() -> dict:
+    try:
+        import psutil
+        battery = psutil.sensors_battery()
+        if battery is not None:
+            return {
+                "battery_percent": round(float(battery.percent), 1),
+                "battery_plugged": bool(battery.power_plugged),
+            }
+    except Exception:
+        pass
+    try:
+        for base in glob.glob("/sys/class/power_supply/*"):
+            if not os.path.exists(os.path.join(base, "capacity")):
+                continue
+            with open(os.path.join(base, "capacity"), encoding="utf-8") as f:
+                percent = float(f.read().strip())
+            status_path = os.path.join(base, "status")
+            status = ""
+            if os.path.exists(status_path):
+                with open(status_path, encoding="utf-8") as f:
+                    status = f.read().strip().lower()
+            return {"battery_percent": percent, "battery_plugged": status in {"charging", "full"}}
+    except Exception:
+        pass
+    return {}
+
+
+def temperature_c() -> float | None:
+    try:
+        for path in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+            with open(path, encoding="utf-8") as f:
+                raw = float(f.read().strip())
+            value = raw / 1000.0 if raw > 200 else raw
+            if -20 <= value <= 150:
+                return round(value, 1)
+    except Exception:
+        pass
+    try:
+        import psutil
+        sensors = psutil.sensors_temperatures()
+        values = [entry.current for group in sensors.values() for entry in group
+                  if entry.current is not None and -20 <= entry.current <= 150]
+        return round(max(values), 1) if values else None
+    except Exception:
+        return None
+
+
+def collect_telemetry() -> dict:
+    telemetry = {
+        "available_ram_mb": available_memory_mb(),
+        "cpu_percent": cpu_percent(),
+        "temperature_c": temperature_c(),
+    }
+    telemetry.update(gpu_metrics())
+    telemetry.update(battery_metrics())
+    return {key: value for key, value in telemetry.items() if value is not None}
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Join a MeshLLM pool with the owner's consent.")
     parser.add_argument("--server", required=True, help="Coordinator URL, e.g. http://192.168.1.10:8765")
@@ -58,10 +206,16 @@ async def main() -> None:
     parser.add_argument("--max-parallel-jobs", type=int, default=1, choices=range(1, 17))
     args = parser.parse_args()
 
+    telemetry = collect_telemetry()
+    detected_gpu = telemetry.get("gpu_name") or gpu_name()
     print("MeshLLM worker — explicit opt-in")
     print(f"Device: {args.name} ({platform.system()} {platform.machine()})")
-    print(f"CPU threads: {os.cpu_count() or 1}; RAM: {memory_mb()} MB")
-    print(f"GPU detected: {gpu_name() or 'not detected'}")
+    print(f"CPU threads: {os.cpu_count() or 1}; RAM: {memory_mb()} MB total")
+    print(f"Available RAM: {telemetry.get('available_ram_mb', 'unknown')} MB; "
+          f"CPU load: {telemetry.get('cpu_percent', 'unknown')}%")
+    print(f"GPU detected: {detected_gpu or 'not detected'}")
+    print(f"Temperature: {telemetry.get('temperature_c', 'unknown')}°C; "
+          f"battery: {telemetry.get('battery_percent', 'unknown')}%")
     print(f"Ollama: {args.ollama_url or 'disabled'}; llama.cpp RPC: {args.rpc_endpoint or 'not configured'}")
     print("RPC exposes compute, not a secure authenticated tunnel. Use only on a trusted isolated LAN.")
     if input("Join this coordinator and allow the configured workloads? [y/N] ").strip().lower() not in {"y", "yes"}:
@@ -77,7 +231,7 @@ async def main() -> None:
         response = await client.post(base + "/api/workers/register", json={
             "name": args.name, "platform": f"{platform.system()} {platform.machine()}",
             "cpu_threads": os.cpu_count() or 1, "ram_mb": memory_mb(),
-            "gpu_name": gpu_name(),
+            "gpu_name": detected_gpu, **telemetry,
             "runtimes": (["ollama"] if args.ollama_url else []) + (["llama.cpp-rpc"] if args.rpc_endpoint else []),
             "ollama_url": args.ollama_url, "rpc_endpoint": args.rpc_endpoint,
             "max_parallel_jobs": args.max_parallel_jobs, "pairing_token": pairing_token,
@@ -87,7 +241,10 @@ async def main() -> None:
         print(f"Joined. Worker ID: {worker_id}. Press Ctrl+C to leave.")
         try:
             while True:
-                await client.post(base + f"/api/workers/{worker_id}/heartbeat")
+                await client.post(
+                    base + f"/api/workers/{worker_id}/heartbeat",
+                    json=collect_telemetry(),
+                )
                 await asyncio.sleep(10)
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
