@@ -121,7 +121,9 @@ class PairSessionRequest(BaseModel):
     battery_plugged: bool | None = None
     temperature_c: float | None = Field(default=None, ge=-20, le=150)
     cpu_benchmark_score: float | None = Field(default=None, ge=0, le=10_000_000)
+    gpu_benchmark_score: float | None = Field(default=None, ge=0, le=10_000_000)
     network_rtt_ms: float | None = Field(default=None, ge=0, le=60_000)
+    network_mbps: float | None = Field(default=None, ge=0, le=100_000)
 
 
 class HeartbeatMetrics(BaseModel):
@@ -134,7 +136,9 @@ class HeartbeatMetrics(BaseModel):
     battery_plugged: bool | None = None
     temperature_c: float | None = Field(default=None, ge=-20, le=150)
     cpu_benchmark_score: float | None = Field(default=None, ge=0, le=10_000_000)
+    gpu_benchmark_score: float | None = Field(default=None, ge=0, le=10_000_000)
     network_rtt_ms: float | None = Field(default=None, ge=0, le=60_000)
+    network_mbps: float | None = Field(default=None, ge=0, le=100_000)
 
 
 class JobRequest(BaseModel):
